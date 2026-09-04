@@ -2,17 +2,17 @@ import math
 from typing import Optional
 
 import torch
-from sgl_kernel_npu.fla.kda_chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h_npu,
-)
+# from sgl_kernel_npu.fla.kda_chunk_delta_h import (
+#     chunk_gated_delta_rule_fwd_h_npu,
+# )
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-from sgl_kernel_npu.fla.kda_prefill import (
-    chunk_gla_fwd_o_gk_npu,
-    recompute_w_u_fwd_npu,
-)
+# from sgl_kernel_npu.fla.kda_prefill import (
+#     chunk_gla_fwd_o_gk_npu,
+#     recompute_w_u_fwd_npu,
+# )
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+# from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
+# from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
@@ -21,8 +21,9 @@ from sgl_kernel_npu.mamba.causal_conv1d_verify import (
     causal_conv1d_linear_verify_npu,
 )
 
-from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
-from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+# from cann_ops_transformer.ops import chunk_kda_fwd
+# from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+# from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
@@ -55,67 +56,120 @@ class _AscendKDAExtendKernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
         v = v.contiguous()
+        g = g.contiguous()
         beta = beta.contiguous()
-        chunk_indices = prepare_chunk_indices(query_start_loc, chunk_size)
-        g = chunk_local_cumsum(
-            g.contiguous(),
-            chunk_size=chunk_size,
-            scale=_LOG2_E,
-            cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
+        # if not ssm_states.is_contiguous():
+        #     raise RuntimeError(
+        #         "Ascend KDA requires a contiguous [pool, H, V, K] state cache; "
+        #         f"got shape={tuple(ssm_states.shape)}, stride={ssm_states.stride()}."
+        #     )
+
+        # chunk_kda_fwd accepts one initial state per logical sequence, while
+        # SGLang owns a slot-indexed persistent pool. Gather the active slots in
+        # canonical contiguous [N, H, V, K] layout and scatter final_state back.
+        num_sequences = query_start_loc.shape[0] - 1
+        source_indices = cache_indices[:num_sequences].to(torch.long)
+        valid_state_mask = source_indices >= 0
+        # Forward metadata may use -1 for a padded request.  index_select would
+        # otherwise read the last cache slot and index_copy_ would overwrite it.
+        # Slot 0 is a gather placeholder for that padded row; its computed result
+        # is irrelevant because padded rows are filtered before state writeback.
+        gather_indices = source_indices.clamp_min(0)
+        initial_state = (
+            ssm_states.index_select(0, gather_indices)
+            .to(dtype=torch.float32)
+            .contiguous()
         )
 
-        triangular, query_key = chunk_kda_scaled_dot_kkt_fwd(
-            q=q,
-            k=k,
-            gk=g,
-            beta=beta,
-            scale=k.shape[-1] ** -0.5,
-            cu_seqlens=query_start_loc,
-            output_dtype=torch.float32,
+        # Supplying the host mirror avoids a device-to-host synchronization in
+        # the custom op's varlen output-shape preparation on every KDA layer.
+        # seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+        # cu_seqlens_cpu = None
+        # if seq_lens_cpu is not None:
+        #     cu_seqlens_cpu = [0]
+        #     for seq_len in seq_lens_cpu[:num_sequences]:
+        #         cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + int(seq_len))
+
+        # T = q.shape[1]
+
+        # if T <= 0:
+        #     raise RuntimeError(
+        #         f"[KDA DEBUG] empty q before chunk_kda_fwd: "
+        #         f"q.shape={tuple(q.shape)}, "
+        #         f"k.shape={tuple(k.shape)}, "
+        #         f"v.shape={tuple(v.shape)}, "
+        #         f"query_start_loc.shape={tuple(query_start_loc.shape)}"
+        #     )
+
+        # if num_sequences <= 0:
+        #     raise RuntimeError(
+        #         f"[KDA DEBUG] no sequence before chunk_kda_fwd: "
+        #         f"q.shape={tuple(q.shape)}, "
+        #         f"query_start_loc.shape={tuple(query_start_loc.shape)}"
+        #     )
+
+        scale = k.shape[-1] ** -0.5
+        # print("------------tag fix:chunk kda fwd-------------")
+        # print("q.shape:",q.shape)
+        # print("query_start_loc dtype:",query_start_loc.dtype)
+        # qsl = query_start_loc.cpu().tolist()
+
+        # seq_lens = [
+        #     qsl[i + 1] - qsl[i]
+        #     for i in range(len(qsl) - 1)
+        # ]
+
+        # chunk_count_py = sum(
+        #     (x + chunk_size - 1) // chunk_size
+        #     for x in seq_lens
+        # )
+
+        # print(
+        #     "\n====== KDA DEBUG ======\n"
+        #     f"q.shape={tuple(q.shape)}\n"
+        #     f"q T={q.shape[1]}\n"
+        #     f"query_start_loc.dtype={query_start_loc.dtype}\n"
+        #     f"query_start_loc.shape={tuple(query_start_loc.shape)}\n"
+        #     # f"query_start_loc={qsl}\n"
+        #     # f"seq_lens={seq_lens}\n"
+        #     f"chunk_count_py={chunk_count_py}\n"
+        #     f"num_sequences={num_sequences}\n"
+        #     "=======================\n",
+        #     flush=True,
+        # )
+        query_start_loc = (
+            query_start_loc
+            .to(dtype=torch.int64)
+            .contiguous()
         )
-        triangular = solve_tril_npu(
-            A=triangular,
-            cu_seqlens=query_start_loc,
-            output_dtype=k.dtype,
-        )
-        w, u, gated_k = recompute_w_u_fwd_npu(
-            k=k,
-            v=v,
-            beta=beta,
-            A=triangular,
-            gk=g,
-            cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
-        )
-        del triangular
-        chunk_states, new_values = chunk_gated_delta_rule_fwd_h_npu(
-            k=gated_k,
-            w=w,
-            u=u,
-            gk=g,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            chunk_indices=chunk_indices,
-            use_exp2=True,
-        )
-        del w, u, gated_k
-        out = chunk_gla_fwd_o_gk_npu(
-            q=q,
-            v=new_values,
-            g=g,
-            A=query_key,
-            h=chunk_states,
-            out=v,
-            scale=k.shape[-1] ** -0.5,
+        # print("before return_intermediate_states:",return_intermediate_states)
+        outputs = torch.ops.npu.chunk_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
             cu_seqlens=query_start_loc,
             chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
+            layout="BSND",
+            safe_gate=False,
+            use_gate_in_kernel=False,
+            state_v_first=True,
+            output_h=return_intermediate_states,
         )
-        del query_key, new_values
+        out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
+        valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
+        ssm_states.index_copy_(
+            0,
+            source_indices.index_select(0, valid_positions),
+            final_state.index_select(0, valid_positions).to(dtype=ssm_states.dtype),
+        )
+        # print("return_intermediate_states:",return_intermediate_states)
         if return_intermediate_states:
-            return out, chunk_states.transpose(-1, -2).contiguous()
+            return out, chunk_states
         return out
 
 
@@ -283,6 +337,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             layer, a, b
         )
         track_ssm = self.forward_metadata.has_mamba_track_mask
+        # print("===cache_indices:",cache_indices.shape)
+        # print("===before-ssm_state:",ssm_states.is_contiguous())
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -302,6 +358,10 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
         )
+        # print("===ssm_state:",ssm_states.is_contiguous())
+        # print("===ssm_state.shape:",ssm_states.shape)
+        # print("===track_ssm:",track_ssm)
+
         if track_ssm:
             core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
@@ -602,12 +662,13 @@ class AscendKDAHybridLinearAttnBackend:
                             mamba_steps_to_track,
                         )
                     else:
+                        # No-op self-copy for non-tracked entries so we never run
+                        # bool-mask indexing (aten::nonzero) or a host numel check.
                         track_mask = mamba_steps_to_track >= 0
-                        track_indices = mamba_track_indices[track_mask]
-                        if track_indices.numel() > 0:
-                            conv_states[:, track_indices] = conv_states[
-                                :, dst_indices_tensor[track_mask]
-                            ]
+                        src_slots = torch.where(
+                            track_mask, dst_indices_tensor, mamba_track_indices
+                        )
+                        conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
 
                 if not has_conv_snapshots:
                     if dst_indices_tensor.numel() > 0:
