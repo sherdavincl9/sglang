@@ -49,6 +49,7 @@ class _AscendKDAExtendKernel:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        extend_seq_lens_cpu: list[int],
         return_intermediate_states: bool = False,
         **kwargs,
     ):
@@ -73,6 +74,11 @@ class _AscendKDAExtendKernel:
             .to(dtype=torch.int64)
             .contiguous()
         )
+        # Host copy of query_start_loc: the op counts chunks from it instead of
+        # syncing the device to read query_start_loc.
+        query_start_loc_cpu = torch.tensor(
+            [0, *extend_seq_lens_cpu], dtype=torch.int64
+        ).cumsum(0)
 
         outputs = torch.ops.npu.chunk_kda_fwd(
             q,
@@ -84,6 +90,7 @@ class _AscendKDAExtendKernel:
             initial_state=initial_state,
             output_final_state=True,
             cu_seqlens=query_start_loc,
+            cu_seqlens_cpu=query_start_loc_cpu,
             chunk_size=chunk_size,
             layout="BSND",
             safe_gate=False,
