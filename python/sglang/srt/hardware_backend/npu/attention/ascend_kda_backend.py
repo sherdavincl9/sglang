@@ -61,16 +61,9 @@ class _AscendKDAExtendKernel:
         # chunk_kda_fwd accepts one initial state per logical sequence, while
         # SGLang owns a slot-indexed persistent pool. Gather the active slots in
         # canonical contiguous [N, H, V, K] layout and scatter final_state back.
-        num_sequences = query_start_loc.shape[0] - 1
-        source_indices = cache_indices[:num_sequences].to(torch.long)
-        valid_state_mask = source_indices >= 0
-        # Forward metadata may use -1 for a padded request.  index_select would
-        # otherwise read the last cache slot and index_copy_ would overwrite it.
-        # Slot 0 is a gather placeholder for that padded row; its computed result
-        # is irrelevant because padded rows are filtered before state writeback.
-        gather_indices = source_indices.clamp_min(0)
+        state_indices = cache_indices.to(torch.long)
         initial_state = (
-            ssm_states.index_select(0, gather_indices)
+            ssm_states.index_select(0, state_indices)
             .to(dtype=torch.float32)
             .contiguous()
         )
@@ -99,11 +92,8 @@ class _AscendKDAExtendKernel:
             output_h=return_intermediate_states,
         )
         out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
-        valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
         ssm_states.index_copy_(
-            0,
-            source_indices.index_select(0, valid_positions),
-            final_state.index_select(0, valid_positions).to(dtype=ssm_states.dtype),
+            0, state_indices, final_state.to(dtype=ssm_states.dtype)
         )
 
         if return_intermediate_states:
