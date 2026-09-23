@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 import random
 import shutil
 import tempfile
@@ -20,6 +21,30 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
 )
+
+# --- 诊断用：按 P/D 分别落盘，定位 double free 属于哪一侧 ---------------
+# 跑完后看 $SGLANG_PD_LOG_DIR/{prefill,decode}.err
+_PD_LOG_DIR = pathlib.Path(
+    os.environ.get("SGLANG_PD_LOG_DIR")
+    or f"/tmp/pd-logs-{time.strftime('%Y%m%d-%H%M%S')}"
+)
+
+
+def _side_log_streams(side: str):
+    """Per-run, per-side stdout/stderr sinks for _launch_server_process.
+
+    Line-buffered and deliberately never closed: the reader threads in
+    _launch_server_process are daemons that are never joined, so closing
+    these would race them and drop the shutdown tail -- exactly the lines
+    this is meant to capture. The OS flushes them at process exit.
+    """
+    _PD_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[pd-diag] per-side logs -> {_PD_LOG_DIR}", flush=True)
+    return (
+        open(_PD_LOG_DIR / f"{side}.out", "w", buffering=1),
+        open(_PD_LOG_DIR / f"{side}.err", "w", buffering=1),
+    )
+
 
 register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
@@ -93,6 +118,7 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
             env=env,
+            return_stdout_stderr=_side_log_streams("prefill"),
         )
 
     @classmethod
@@ -209,6 +235,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
             env=env,
+            return_stdout_stderr=_side_log_streams("decode"),
         )
 
     def test_prefill_cache_hit(self):

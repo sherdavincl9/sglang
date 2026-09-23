@@ -253,6 +253,8 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            if self.gracefully_exit:
+                break
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -403,6 +405,8 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            if self.gracefully_exit:
+                break
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]

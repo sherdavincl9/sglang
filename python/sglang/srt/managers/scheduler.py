@@ -5876,6 +5876,7 @@ class Scheduler(
 
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.
+        logger.info("ShutdownReq received; graceful exit requested.")
         self.gracefully_exit = True
         return None
 
@@ -6093,6 +6094,7 @@ def run_scheduler_process(
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
+        logger.info("Scheduler event loop returned.")
 
     except Exception:
         traceback = get_exception_traceback()
@@ -6113,9 +6115,11 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                logger.info("Graceful shutdown: releasing resources.")
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
+                logger.info("Graceful shutdown: resources released.")
 
 
 def _make_abort_req(
