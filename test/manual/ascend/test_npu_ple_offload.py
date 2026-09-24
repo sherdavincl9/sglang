@@ -199,12 +199,16 @@ class TestNpuPleOffload(unittest.TestCase):
                     embedding, rows, _ = self.make_embedding(
                         backend, torch.bfloat16, 13, start=start, end=end
                     )
+                    # Keep the NaN sentinel without requiring an NPU fill kernel
+                    # just to prepare the buffer whose overwrite we are testing.
+                    log("  preparing NaN output buffer on CPU, copying to NPU")
                     out = torch.full(
                         (*ids.shape, 13),
                         float("nan"),
                         dtype=torch.bfloat16,
-                        device=self.device,
-                    )
+                        device="cpu",
+                    ).to(self.device)
+                    log("  NaN output buffer ready")
                     actual = self.lookup(embedding, ids, out=out)
                     self.assertIs(actual, out)
                     self.check(actual, self.reference(rows, ids, start, end))
@@ -318,7 +322,10 @@ class TestNpuPleOffload(unittest.TestCase):
                 stream = torch.npu.Stream(device=self.device)
                 out = torch.empty((128, 257), dtype=torch.bfloat16, device=self.device)
                 for offset in range(4):
-                    ids = (torch.arange(128, device=self.device) + offset) % 8
+                    # Input construction is not under test; keep the H2D producer
+                    # on the main stream and the lookup on the dependent side stream.
+                    ids_cpu = (torch.arange(128, device="cpu") + offset) % 8
+                    ids = ids_cpu.to(self.device)
                     stream.wait_stream(torch.npu.current_stream())
                     ids.record_stream(stream)
                     log(f"  side-stream gather {offset}")
@@ -326,7 +333,7 @@ class TestNpuPleOffload(unittest.TestCase):
                         actual = embedding.gather(ids, out=out)
                     torch.npu.current_stream().wait_stream(stream)
                     self.assertIs(actual, out)
-                    self.check(actual, self.reference(rows, ids, 0, 8))
+                    self.check(actual, self.reference(rows, ids_cpu, 0, 8))
 
     def test_empty_input(self):
         for backend in ("pinned", "file"):
