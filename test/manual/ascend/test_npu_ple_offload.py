@@ -19,6 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
 from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
+from sglang.srt.models.qwen4_exp_ple_table import PLE_FILE_PREFETCH_MIN_ROWS
 
 
 class TestNpuPleOffload(unittest.TestCase):
@@ -161,6 +162,32 @@ class TestNpuPleOffload(unittest.TestCase):
         second = embedding.gather(ids).cpu()
         self.assertFalse(torch.equal(first[0], second[0]))
         torch.testing.assert_close(second, reopened[[2, 5, 2]], rtol=0, atol=0)
+
+    def test_file_prefetch_hint_from_host_ids(self):
+        """A prefill-sized NPU gather must still hint the file's page cache."""
+        # bf16 rows of 4096 = two 4 KiB pages; shard rows 4..7 are local rows 0..3.
+        embedding, rows, _ = self.make_embedding("file", torch.bfloat16, 4096, 4, 8)
+        prefetcher = embedding._file_prefetcher
+        self.assertIsNotNone(prefetcher, "SGLANG_QWEN4_PLE_FILE_PREFETCH is off")
+        ids = torch.tensor([1, 5, 7, 5], device=self.device).repeat(
+            PLE_FILE_PREFETCH_MIN_ROWS // 4
+        )
+        with (
+            patch.object(prefetcher, "enqueue", wraps=prefetcher.enqueue) as enqueue,
+            patch.object(
+                prefetcher._pool, "submit", wraps=prefetcher._pool.submit
+            ) as submit,
+        ):
+            actual = embedding.gather(ids)
+        self.assertEqual(enqueue.call_args.args[0].device.type, "cpu")
+        submit.assert_called_once()
+        # Global ids 5 and 7 are local rows 1 and 3; id 1 belongs to another shard.
+        self.assertEqual(submit.call_args.args[1], [2, 3, 6, 7])
+        ids_cpu = ids.cpu()
+        valid = (ids_cpu >= 4) & (ids_cpu < 8)
+        expected = torch.zeros((ids.numel(), 4096), dtype=torch.bfloat16)
+        expected[valid] = rows[ids_cpu[valid]]
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
     def test_side_stream_copy_and_repeated_lookup(self):
         for backend in ("pinned", "file"):
