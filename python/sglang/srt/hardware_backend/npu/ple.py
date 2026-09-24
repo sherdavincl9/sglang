@@ -23,7 +23,9 @@ def gather_ple_host_rows(
 ) -> torch.Tensor:
     """Select this rank's rows on the host and stage them to the NPU as bf16."""
     # Blocking D2H: the row set is only known once the IDs are on the host.
-    ids = flat_ids.to("cpu")
+    # Normalize on the host: casting int32 IDs on NPU adds a device operation
+    # even though all index arithmetic below runs on the CPU.
+    ids = flat_ids.to("cpu").long()
     if file_prefetcher is not None:
         file_prefetcher.enqueue(ids, vocab_start=vocab_start, vocab_end=vocab_end)
     in_range = (ids >= vocab_start) & (ids < vocab_end)

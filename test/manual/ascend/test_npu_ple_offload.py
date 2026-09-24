@@ -239,16 +239,25 @@ class TestNpuPleOffload(unittest.TestCase):
             "file", torch.bfloat16, 13, start=4, end=8
         )
         recorder = self.use_recorder(embedding)
-        ids = torch.tensor([[1, 5], [7, 5]], device=self.device)
-        actual = self.lookup(embedding, ids)
-        self.assertEqual(len(recorder.calls), 1)
-        hinted_ids, vocab_start, vocab_end = recorder.calls[0]
-        log(f"  prefetcher got {hinted_ids.device} ids [{vocab_start}, {vocab_end})")
-        # Host ids: the hint must not cost a second device-to-host copy.
-        self.assertEqual(hinted_ids.device.type, "cpu")
-        self.assertEqual(hinted_ids.tolist(), [1, 5, 7, 5])
-        self.assertEqual((vocab_start, vocab_end), (4, 8))
-        self.check(actual, self.reference(rows, ids, 4, 8))
+        for id_dtype in (torch.int32, torch.int64):
+            with self.subTest(ids=id_dtype):
+                recorder.calls.clear()
+                ids = torch.tensor(
+                    [[1, 5], [7, 5]], dtype=id_dtype, device=self.device
+                )
+                actual = self.lookup(embedding, ids)
+                self.assertEqual(len(recorder.calls), 1)
+                hinted_ids, vocab_start, vocab_end = recorder.calls[0]
+                log(
+                    f"  prefetcher got {hinted_ids.device} "
+                    f"ids [{vocab_start}, {vocab_end})"
+                )
+                # Both input dtypes reach the prefetcher as host int64 IDs.
+                self.assertEqual(hinted_ids.device.type, "cpu")
+                self.assertEqual(hinted_ids.dtype, torch.int64)
+                self.assertEqual(hinted_ids.tolist(), [1, 5, 7, 5])
+                self.assertEqual((vocab_start, vocab_end), (4, 8))
+                self.check(actual, self.reference(rows, ids, 4, 8))
 
     def test_prefill_sized_lookup(self):
         """A prefill-sized lookup, with the real file prefetcher and its thread."""
@@ -330,12 +339,16 @@ class TestNpuPleOffload(unittest.TestCase):
     def test_capture_rejected_before_host_row_selection(self):
         embedding, _, _ = self.make_embedding("file", torch.bfloat16, 7)
         recorder = self.use_recorder(embedding)
-        ids = torch.tensor([1], device=self.device)
-        with patch(
-            "sglang.srt.models.qwen4_exp.get_is_capture_mode", return_value=True
-        ):
-            with self.assertRaisesRegex(RuntimeError, "requires eager execution"):
-                embedding.gather(ids)
+        for id_dtype in (torch.int32, torch.int64):
+            with self.subTest(ids=id_dtype):
+                ids = torch.tensor([1], dtype=id_dtype, device=self.device)
+                with patch(
+                    "sglang.srt.models.qwen4_exp.get_is_capture_mode", return_value=True
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "requires eager execution"
+                    ):
+                        embedding.gather(ids)
         # Rejected before any host work: nothing reached the prefetcher.
         self.assertEqual(recorder.calls, [])
         log("  capture rejected before host row selection")

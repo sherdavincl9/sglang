@@ -895,7 +895,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 )
             output = out
 
-        flat_ids = input_ids.reshape(-1).long()
+        flat_ids = input_ids.reshape(-1)
         if flat_ids.numel():
             if input_ids.device.type == "npu":
                 if get_is_capture_mode():
@@ -914,6 +914,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_end=self.shard_indices.org_vocab_end_index,
                     file_prefetcher=self._file_prefetcher,
                 )
+            flat_ids = flat_ids.long()
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
