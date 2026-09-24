@@ -2,9 +2,17 @@
 
 Run: python3 test/manual/ascend/test_npu_ple_offload.py -v
 No model weights, UVA configuration, or custom host-mapping operators needed.
+
+Progress goes to stdout with elapsed time. A test running longer than
+SGLANG_TEST_PLE_TIMEOUT_S (default 300) dumps every thread's stack and exits
+the process instead of hanging.
 """
 
+import faulthandler
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,18 +29,52 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
 from sglang.srt.models.qwen4_exp_ple_table import PLE_FILE_PREFETCH_MIN_ROWS
 
+# Arbitrary; every test here takes seconds when healthy.
+TIMEOUT_S = float(os.environ.get("SGLANG_TEST_PLE_TIMEOUT_S", "300"))
+_START = time.monotonic()
+
+
+def log(message: str) -> None:
+    print(f"[ple-test +{time.monotonic() - _START:8.2f}s] {message}", flush=True)
+
+
+class RecordingPrefetcher:
+    """Stands in for PleFilePrefetcher: records enqueue calls, starts no thread."""
+
+    def __init__(self):
+        self.calls = []
+
+    def enqueue(self, flat_ids, *, vocab_start=0, vocab_end=None):
+        self.calls.append((flat_ids.clone(), vocab_start, vocab_end))
+        return True
+
+    def close(self):
+        pass
+
 
 class TestNpuPleOffload(unittest.TestCase):
     def setUp(self):
         if not torch.npu.is_available():
             self.skipTest("NPU not available")
+        name = self._testMethodName
+        log(f"{name}: start")
+        # A hang inside C code never returns to Python, so only a watchdog helps.
+        faulthandler.dump_traceback_later(TIMEOUT_S, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
+        self.addCleanup(log, f"{name}: cleanup done")
         self.device = torch.device("npu:0")
         torch.npu.set_device(self.device)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 
-    def make_embedding(self, backend, dtype, dim, start=0, end=8):
+    def make_embedding(self, backend, dtype, dim, *, start=0, end=None, vocab=8):
+        """A host-table embedding holding rows [start, end) of a vocab-row table."""
+        end = vocab if end is None else end
+        log(
+            f"make_embedding: {backend} {dtype} dim={dim} "
+            f"rows [{start}, {end}) of {vocab}"
+        )
         # The real constructor builds the table on meta before offloading.
         weight = nn.Parameter(
             torch.empty((end - start, dim), dtype=dtype, device="meta"),
@@ -42,12 +84,12 @@ class TestNpuPleOffload(unittest.TestCase):
         shard = VocabParallelEmbeddingShardIndices(
             padded_org_vocab_start_index=start,
             padded_org_vocab_end_index=end,
-            padded_added_vocab_start_index=8,
-            padded_added_vocab_end_index=8,
+            padded_added_vocab_start_index=vocab,
+            padded_added_vocab_end_index=vocab,
             org_vocab_start_index=start,
             org_vocab_end_index=end,
-            added_vocab_start_index=8,
-            added_vocab_end_index=8,
+            added_vocab_start_index=vocab,
+            added_vocab_end_index=vocab,
         )
         source = SimpleNamespace(
             weight=weight,
@@ -55,13 +97,13 @@ class TestNpuPleOffload(unittest.TestCase):
             enable_tp=True,
             use_attn_tp_group=False,
             tp_size=1,
-            num_embeddings=8,
-            org_vocab_size=8,
+            num_embeddings=vocab,
+            org_vocab_size=vocab,
             padding_size=1,
             num_added_embeddings=0,
             use_presharded_weights=False,
-            org_vocab_size_padded=8,
-            num_embeddings_padded=8,
+            org_vocab_size_padded=vocab,
+            num_embeddings_padded=vocab,
             shard_indices=shard,
             embedding_dim=dim,
             weight_scale=torch.tensor([0.5], device=self.device),
@@ -70,19 +112,21 @@ class TestNpuPleOffload(unittest.TestCase):
             num_org_embeddings_per_partition=end - start,
             num_added_embeddings_per_partition=0,
         )
-        table_dir = self.directory / f"{backend}_{dtype}_{dim}_{start}_{end}"
+        table_dir = Path(tempfile.mkdtemp(dir=self.directory))
         embedding = Qwen4ExpPinnedHostEmbedding(
             source, backend=backend, table_dir=str(table_dir)
         )
         # Keep the mapped storage alive until its background workers stop.
         self.addCleanup(self.close_embedding, embedding)
+        log(f"  table allocated, files: {sorted(os.listdir(table_dir))}")
         rows = (
-            ((torch.arange(8 * dim, dtype=torch.float32) % 31 - 15) / 4)
-            .reshape(8, dim)
+            ((torch.arange(vocab * dim, dtype=torch.float32) % 31 - 15) / 4)
+            .reshape(vocab, dim)
             .to(dtype)
         )
         ptr = embedding.weight.data_ptr()
         embedding.weight_loader(embedding.weight, rows)
+        log("  rows loaded")
         self.assertEqual(embedding.weight.data_ptr(), ptr)
         self.assertEqual(embedding.weight.device.type, "cpu")
         self.assertEqual(embedding.weight.dtype, dtype)
@@ -95,6 +139,36 @@ class TestNpuPleOffload(unittest.TestCase):
         for worker in (embedding._file_prefetcher, embedding._file_rss_trimmer):
             if worker is not None:
                 worker.close()
+        log("  embedding workers closed")
+
+    @staticmethod
+    def use_recorder(embedding):
+        if embedding._file_prefetcher is not None:
+            embedding._file_prefetcher.close()
+        recorder = RecordingPrefetcher()
+        embedding._file_prefetcher = recorder
+        return recorder
+
+    def lookup(self, embedding, ids, **kwargs):
+        log(f"  gather: ids {tuple(ids.shape)} {ids.dtype}")
+        actual = embedding.gather(ids, **kwargs)
+        log("  gather returned, synchronizing")
+        torch.npu.synchronize()
+        log("  synchronized")
+        return actual
+
+    @staticmethod
+    def reference(rows, ids, start, end):
+        """bf16 rows for ids in [start, end), zeros elsewhere."""
+        ids = ids.cpu().long()
+        valid = (ids >= start) & (ids < end)
+        expected = torch.zeros((*ids.shape, rows.shape[1]), dtype=torch.bfloat16)
+        expected[valid] = rows.to(torch.bfloat16)[ids[valid]]
+        return expected
+
+    def check(self, actual, expected):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        log("  matches reference")
 
     def test_pinned_and_file_gather(self):
         for backend in ("pinned", "file"):
@@ -112,21 +186,18 @@ class TestNpuPleOffload(unittest.TestCase):
                                 dtype=id_dtype,
                                 device=self.device,
                             )
-                            actual = embedding(ids)
-                            expected = rows.to(torch.bfloat16)[ids.cpu().long()]
-                            torch.testing.assert_close(
-                                actual.cpu(), expected, rtol=0, atol=0
-                            )
+                            actual = self.lookup(embedding, ids)
+                            self.check(actual, self.reference(rows, ids, 0, 8))
 
     def test_shard_boundaries_duplicates_and_output_buffer(self):
-        # Simulate two disjoint TP shards without an HCCL process group.
+        # Two disjoint TP shards without an HCCL process group; their sum is the table.
         ids = torch.tensor([[-1, 0, 3], [4, 7, 8], [7, 4, 99]], device=self.device)
         for backend in ("pinned", "file"):
             with self.subTest(backend=backend):
                 combined = torch.zeros((*ids.shape, 13), dtype=torch.bfloat16)
                 for start, end in ((0, 4), (4, 8)):
                     embedding, rows, _ = self.make_embedding(
-                        backend, torch.bfloat16, 13, start, end
+                        backend, torch.bfloat16, 13, start=start, end=end
                     )
                     out = torch.full(
                         (*ids.shape, 13),
@@ -134,18 +205,14 @@ class TestNpuPleOffload(unittest.TestCase):
                         dtype=torch.bfloat16,
                         device=self.device,
                     )
-                    actual = embedding.gather(ids, out=out)
+                    actual = self.lookup(embedding, ids, out=out)
                     self.assertIs(actual, out)
-                    expected = torch.zeros_like(combined)
-                    ids_cpu = ids.cpu()
-                    valid = (ids_cpu >= start) & (ids_cpu < end)
-                    expected[valid] = rows[ids_cpu[valid]]
-                    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+                    self.check(actual, self.reference(rows, ids, start, end))
                     combined += actual.cpu()
-                expected = torch.zeros_like(combined)
-                valid = (ids_cpu >= 0) & (ids_cpu < 8)
-                expected[valid] = rows[ids_cpu[valid]]
-                torch.testing.assert_close(combined, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    combined, self.reference(rows, ids, 0, 8), rtol=0, atol=0
+                )
+                log("  shard sum matches the full table")
 
     def test_file_directory_persistence_and_updated_rows(self):
         embedding, rows, directory = self.make_embedding("file", torch.bfloat16, 13)
@@ -156,73 +223,122 @@ class TestNpuPleOffload(unittest.TestCase):
             str(files[0]), shared=True, size=rows.numel(), dtype=rows.dtype
         ).reshape_as(rows)
         torch.testing.assert_close(reopened, rows, rtol=0, atol=0)
+        log("  file holds the loaded rows")
         ids = torch.tensor([2, 5, 2], device=self.device)
-        first = embedding.gather(ids).cpu()
+        first = self.lookup(embedding, ids).cpu()
+        # A write through another mapping of the same file must be visible.
         reopened[2].fill_(42)
-        second = embedding.gather(ids).cpu()
+        second = self.lookup(embedding, ids).cpu()
         self.assertFalse(torch.equal(first[0], second[0]))
         torch.testing.assert_close(second, reopened[[2, 5, 2]], rtol=0, atol=0)
+        log("  lookup sees the updated file contents")
 
-    def test_file_prefetch_hint_from_host_ids(self):
-        """A prefill-sized NPU gather must still hint the file's page cache."""
-        # bf16 rows of 4096 = two 4 KiB pages; shard rows 4..7 are local rows 0..3.
-        embedding, rows, _ = self.make_embedding("file", torch.bfloat16, 4096, 4, 8)
-        prefetcher = embedding._file_prefetcher
-        self.assertIsNotNone(prefetcher, "SGLANG_QWEN4_PLE_FILE_PREFETCH is off")
-        ids = torch.tensor([1, 5, 7, 5], device=self.device).repeat(
-            PLE_FILE_PREFETCH_MIN_ROWS // 4
+    def test_file_gather_hands_host_ids_to_prefetcher(self):
+        """The NPU gather must hint the file prefetcher with host ids and its shard."""
+        embedding, rows, _ = self.make_embedding(
+            "file", torch.bfloat16, 13, start=4, end=8
         )
-        with (
-            patch.object(prefetcher, "enqueue", wraps=prefetcher.enqueue) as enqueue,
-            patch.object(
-                prefetcher._pool, "submit", wraps=prefetcher._pool.submit
-            ) as submit,
-        ):
-            actual = embedding.gather(ids)
-        self.assertEqual(enqueue.call_args.args[0].device.type, "cpu")
-        submit.assert_called_once()
-        # Global ids 5 and 7 are local rows 1 and 3; id 1 belongs to another shard.
-        self.assertEqual(submit.call_args.args[1], [2, 3, 6, 7])
-        ids_cpu = ids.cpu()
-        valid = (ids_cpu >= 4) & (ids_cpu < 8)
-        expected = torch.zeros((ids.numel(), 4096), dtype=torch.bfloat16)
-        expected[valid] = rows[ids_cpu[valid]]
-        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        recorder = self.use_recorder(embedding)
+        ids = torch.tensor([[1, 5], [7, 5]], device=self.device)
+        actual = self.lookup(embedding, ids)
+        self.assertEqual(len(recorder.calls), 1)
+        hinted_ids, vocab_start, vocab_end = recorder.calls[0]
+        log(f"  prefetcher got {hinted_ids.device} ids [{vocab_start}, {vocab_end})")
+        # Host ids: the hint must not cost a second device-to-host copy.
+        self.assertEqual(hinted_ids.device.type, "cpu")
+        self.assertEqual(hinted_ids.tolist(), [1, 5, 7, 5])
+        self.assertEqual((vocab_start, vocab_end), (4, 8))
+        self.check(actual, self.reference(rows, ids, 4, 8))
 
-    def test_side_stream_copy_and_repeated_lookup(self):
+    def test_prefill_sized_lookup(self):
+        """A prefill-sized lookup, with the real file prefetcher and its thread."""
+        tokens, heads, vocab, dim = 2048, 16, 4096, 160
+        start, end = vocab // 4, vocab
+        generator = torch.Generator().manual_seed(0)
+        ids_cpu = torch.randint(0, vocab, (tokens, heads), generator=generator)
+        self.assertGreaterEqual(ids_cpu.numel(), PLE_FILE_PREFETCH_MIN_ROWS)
+        for backend in ("pinned", "file"):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(backend=backend, dtype=dtype):
+                    embedding, rows, _ = self.make_embedding(
+                        backend, dtype, dim, start=start, end=end, vocab=vocab
+                    )
+                    prefetcher = embedding._file_prefetcher
+                    if backend == "file":
+                        self.assertIsNotNone(
+                            prefetcher, "SGLANG_QWEN4_PLE_FILE_PREFETCH is off"
+                        )
+                    queued = self.log_prefetcher_calls(prefetcher)
+                    ids = ids_cpu.to(self.device)
+                    log(f"  live threads: {threading.active_count()}")
+                    actual = self.lookup(embedding, ids)
+                    self.check(actual, self.reference(rows, ids_cpu, start, end))
+                    if backend == "pinned":
+                        self.assertIsNone(prefetcher)
+                        continue
+                    self.assertEqual(queued, [True])
+                    log("  waiting for the prefetch worker")
+                    prefetcher._pool.shutdown(wait=True)
+                    log(f"  prefetch worker done, threads: {threading.active_count()}")
+
+    @staticmethod
+    def log_prefetcher_calls(prefetcher):
+        """Log around each real enqueue; returns the list its results land in."""
+        results = []
+        if prefetcher is None:
+            return results
+        enqueue = prefetcher.enqueue
+
+        def logged_enqueue(*args, **kwargs):
+            log("  prefetcher.enqueue: enter")
+            queued = enqueue(*args, **kwargs)
+            log(f"  prefetcher.enqueue: queued={queued}")
+            results.append(queued)
+            return queued
+
+        prefetcher.enqueue = logged_enqueue
+        return results
+
+    def test_side_stream_lookup_into_reused_buffer(self):
+        # As in Qwen4ExpPLELayer: a side stream refills one buffer, main waits.
         for backend in ("pinned", "file"):
             with self.subTest(backend=backend):
                 embedding, rows, _ = self.make_embedding(
                     backend, torch.bfloat16, 257
                 )
                 stream = torch.npu.Stream(device=self.device)
+                out = torch.empty((128, 257), dtype=torch.bfloat16, device=self.device)
                 for offset in range(4):
                     ids = (torch.arange(128, device=self.device) + offset) % 8
                     stream.wait_stream(torch.npu.current_stream())
                     ids.record_stream(stream)
+                    log(f"  side-stream gather {offset}")
                     with torch.npu.stream(stream):
-                        actual = embedding.gather(ids)
+                        actual = embedding.gather(ids, out=out)
                     torch.npu.current_stream().wait_stream(stream)
-                    expected = rows[ids.cpu()]
-                    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+                    self.assertIs(actual, out)
+                    self.check(actual, self.reference(rows, ids, 0, 8))
 
     def test_empty_input(self):
         for backend in ("pinned", "file"):
             with self.subTest(backend=backend):
                 embedding, _, _ = self.make_embedding(backend, torch.bfloat16, 7)
-                actual = embedding.gather(
-                    torch.empty((0, 3), dtype=torch.int64, device=self.device)
-                )
+                ids = torch.empty((0, 3), dtype=torch.int64, device=self.device)
+                actual = self.lookup(embedding, ids)
                 self.assertEqual(actual.shape, (0, 3, 7))
 
     def test_capture_rejected_before_host_row_selection(self):
         embedding, _, _ = self.make_embedding("file", torch.bfloat16, 7)
+        recorder = self.use_recorder(embedding)
         ids = torch.tensor([1], device=self.device)
         with patch(
             "sglang.srt.models.qwen4_exp.get_is_capture_mode", return_value=True
         ):
             with self.assertRaisesRegex(RuntimeError, "requires eager execution"):
                 embedding.gather(ids)
+        # Rejected before any host work: nothing reached the prefetcher.
+        self.assertEqual(recorder.calls, [])
+        log("  capture rejected before host row selection")
 
 
 if __name__ == "__main__":
