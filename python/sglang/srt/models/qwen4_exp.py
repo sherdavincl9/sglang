@@ -72,7 +72,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, get_device_module, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -783,7 +783,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from host memory (pinned, or a file-backed mmap).
+    """Host PLE table (pinned or mmap), gathered directly or staged on NPU.
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -897,6 +897,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            if input_ids.device.type == "npu":
+                if get_is_capture_mode():
+                    raise RuntimeError(
+                        "NPU PLE host offload requires eager execution because "
+                        "row selection reads device IDs on the CPU. "
+                        "Use --cuda-graph-backend-decode=disabled."
+                    )
+                from sglang.srt.hardware_backend.npu.ple import gather_ple_host_rows
+
+                return gather_ple_host_rows(
+                    self.weight,
+                    flat_ids,
+                    output,
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
+                    file_prefetcher=self._file_prefetcher,
+                )
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
@@ -996,7 +1013,7 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            get_device_module().Stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1160,7 +1177,7 @@ class Qwen4ExpPLELayer(nn.Module):
         batch: Optional[_PLEBatch],
         forward_batch: ForwardBatch,
     ) -> None:
-        """Gather PLE rows via UVA while the preceding decoder layer runs."""
+        """Gather host PLE rows while the preceding decoder layer runs."""
         if self._prefetch_stream is None:
             return
         if self._prefetch_state is not None:
@@ -1187,9 +1204,10 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        device_module = get_device_module()
+        stream.wait_stream(device_module.current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with device_module.stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
@@ -1199,7 +1217,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        get_device_module().current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
