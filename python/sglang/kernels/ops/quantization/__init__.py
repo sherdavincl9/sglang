@@ -18,6 +18,36 @@ if TYPE_CHECKING:
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 
+for _name in ("quantize_store", "dequantize_rows"):
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.npu_nvfp4_{_name}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.npu_nvfp4:{_name}",
+            capabilities=frozenset({CapabilityRequirement.NPU}),
+            format_signature=FormatSignature(
+                supported_dtypes=("bfloat16", "float16", "float32"),
+                in_place=True,
+                description="Ascend packed E2M1 data with E4M3 block scales",
+            ),
+            description=f"Ascend software NVFP4 {_name}.",
+        )
+    )
+del _name
+
+
+def npu_nvfp4_quantize_store(*args, **kwargs):
+    return get_kernel("quantization.npu_nvfp4_quantize_store", KernelBackend.TRITON)(
+        *args, **kwargs
+    )
+
+
+def npu_nvfp4_dequantize_rows(*args, **kwargs):
+    return get_kernel("quantization.npu_nvfp4_dequantize_rows", KernelBackend.TRITON)(
+        *args, **kwargs
+    )
+
+
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",

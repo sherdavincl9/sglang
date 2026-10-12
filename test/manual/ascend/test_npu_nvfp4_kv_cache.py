@@ -53,6 +53,37 @@ class TestNPUNVFP4KVCache(CustomTestCase):
             atol=0,
         )
 
+    def test_store_scale_and_fp4_midpoints(self):
+        table = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+        midpoints = (table[:-1] + table[1:]) / 2
+        samples = torch.cat((table, midpoints, midpoints * 0.999, midpoints * 1.001))
+        source = torch.zeros(samples.numel() + 1, 1, 16)
+        source[:-1, 0, -1] = samples * 6
+        source[-1, 0] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6] * 2)
+        expected = reference_quantize(source, 1.0)
+        packed = torch.empty(
+            source.shape[0], 1, 8, dtype=torch.uint8, device=self.device
+        )
+        scales = torch.empty(
+            source.shape[0], 1, 1, dtype=torch.uint8, device=self.device
+        )
+        global_buffer = torch.empty(source.shape[0], 1, 1, device=self.device)
+        self.make_method().quantize_and_store(
+            packed,
+            packed,
+            scales,
+            scales,
+            torch.arange(source.shape[0], device=self.device),
+            source.to(self.device),
+            source.to(self.device),
+            1.0,
+            1.0,
+            k_global_scale_buffer=global_buffer,
+            v_global_scale_buffer=global_buffer,
+        )
+        torch.testing.assert_close(packed.cpu(), expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(scales.cpu(), expected[1], rtol=0, atol=0)
+
     def test_bytes_and_dequant_match_reference(self):
         source = torch.randn(19, 3, 64, generator=torch.Generator().manual_seed(42))
         source[0] = 0
@@ -173,6 +204,80 @@ class TestNPUNVFP4KVCache(CustomTestCase):
         actual = pool.get_key_buffer(0).reshape(-1, 2, 64)[loc].cpu()
         torch.testing.assert_close(actual, expected[2].bfloat16(), rtol=0.01, atol=1e-7)
         self.assertTrue(torch.isfinite(actual).all())
+
+    def test_live_pages_and_unquantized_current_prefill(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                method = self.make_method(dtype)
+                pool = NPUNVFP4TokenToKVPool(
+                    size=512,
+                    page_size=16,
+                    dtype=torch.float4_e2m1fn_x2,
+                    head_num=2,
+                    head_dim=64,
+                    layer_num=2,
+                    device=self.device,
+                    enable_memory_saver=False,
+                    enable_alt_stream=False,
+                    quant_method=method,
+                )
+                source = torch.randn(
+                    32, 2, 64, generator=torch.Generator().manual_seed(89)
+                ).to(dtype)
+                loc = torch.arange(16, 48, device=self.device)
+                for layer_id in (0, 1):
+                    pool.set_kv_buffer(
+                        SimpleNamespace(layer_id=layer_id),
+                        loc,
+                        source.to(self.device),
+                        source.to(self.device),
+                        k_scale=0.1,
+                        v_scale=0.1,
+                    )
+                pool.dq_k_buffer.fill_(float("nan"))
+                pool.dq_v_buffer.fill_(float("nan"))
+                # Two requests share a prefix page; the second table's padded
+                # page 20 must never be read or written.
+                pool.prepare_forward(
+                    torch.tensor([[1, 2], [1, 20]], device=self.device),
+                    torch.tensor([32, 16], device=self.device),
+                    preserve_current=True,
+                )
+                fresh = source[16:].to(self.device)
+                pool.set_kv_buffer(
+                    SimpleNamespace(layer_id=0),
+                    loc[16:],
+                    fresh,
+                    fresh,
+                    k_scale=0.1,
+                    v_scale=0.1,
+                )
+                key = pool.get_key_buffer(0).reshape(-1, 2, 64)
+                value = pool.get_value_buffer(0).reshape(-1, 2, 64)
+                expected_prefix = reference_quantize(source[:16], 0.1)[2].to(dtype)
+                torch.testing.assert_close(
+                    key[16:32].cpu(), expected_prefix, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    key[32:48].cpu(), source[16:], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    value[32:48].cpu(), source[16:], rtol=0, atol=0
+                )
+                self.assertTrue(torch.isnan(key[320:336]).all())
+                # Decode uses persistent NVFP4 rows, with no stale prefill override.
+                pool.prepare_forward(
+                    torch.tensor([[1, 2]], device=self.device),
+                    torch.tensor([32], device=self.device),
+                    preserve_current=False,
+                )
+                decoded = pool.get_key_buffer(0).reshape(-1, 2, 64)[16:48].cpu()
+                torch.testing.assert_close(
+                    decoded,
+                    reference_quantize(source, 0.1)[2].to(dtype),
+                    rtol=0,
+                    atol=0,
+                )
 
 
 if __name__ == "__main__":

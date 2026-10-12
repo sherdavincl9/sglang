@@ -9,7 +9,9 @@ import argparse
 import json
 import math
 import os
+import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -94,6 +96,18 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
     ]
     output = Path(args.output_dir)
     (output / f"{name}.command.json").write_text(json.dumps(command, indent=2))
+    (output / f"{name}.command.sh").write_text(
+        "#!/bin/bash\nset -eu\n"
+        + f"cd {shlex.quote(os.getcwd())}\n"
+        + f"export PYTHONPATH={shlex.quote(os.environ['PYTHONPATH'])}\n"
+        + f"export ASCEND_RT_VISIBLE_DEVICES={shlex.quote(os.environ['ASCEND_RT_VISIBLE_DEVICES'])}\n"
+        + "source /usr/local/Ascend/ascend-toolkit/set_env.sh\n"
+        + "exec "
+        + shlex.join(command)
+        + " > "
+        + shlex.quote(str(output / f"{name}.manual.server.log"))
+        + " 2>&1\n"
+    )
     with (output / f"{name}.server.log").open("w") as log:
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -105,13 +119,9 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
             prompt = "The capital city of France is"
             first = generate(url, prompt, tokens=16)
             repeat = generate(url, prompt, tokens=16)
-            assert first["text"] == repeat["text"], (first, repeat)
-            assert first["meta_info"]["completion_tokens"] >= 8, first
-            assert "Paris" in first["text"], first
             batch = generate(
                 url, ["2 + 2 =", "The capital city of Japan is"], tokens=16
             )
-            assert len(batch) == 2 and all(item["text"] for item in batch), batch
             # More than one prefill chunk, plus a cached-prefix extend request.
             long_prompt = (
                 "The garden has trees, flowers, birds and a fountain. " * 48
@@ -130,9 +140,32 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
                 "cold": cold,
                 "warm": warm,
             }
+            # Flush before every measured call so the latency includes prefill.
+            # Warm up the device and then report repeated measurements.
+            timings = []
+            for iteration in range(10):
+                requests.get(url + "/flush_cache", timeout=30).raise_for_status()
+                started = time.perf_counter()
+                result = generate(url, prompt, tokens=16)
+                elapsed = time.perf_counter() - started
+                if iteration >= 2:
+                    timings.append(elapsed)
+            evidence["latency"] = {
+                "cold_prefill_16_decode_seconds": timings,
+                "median_seconds": statistics.median(timings),
+                "min_seconds": min(timings),
+                "max_seconds": max(timings),
+                "last_response": result,
+            }
             (output / f"{name}.responses.json").write_text(
                 json.dumps(evidence, indent=2, ensure_ascii=False)
             )
+            assert first["text"] == repeat["text"], (first, repeat)
+            assert first["meta_info"]["completion_tokens"] >= 8, first
+            assert "Paris" in first["text"], first
+            assert len(batch) == 2 and all(item["text"] for item in batch), batch
+            assert "4" in batch[0]["text"], batch[0]
+            assert "Tokyo" in batch[1]["text"], batch[1]
             return evidence
         finally:
             stop(process)

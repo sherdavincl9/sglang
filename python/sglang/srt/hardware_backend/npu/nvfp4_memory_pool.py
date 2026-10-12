@@ -20,6 +20,10 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
         if self.use_hnd:
             raise ValueError("NPU NVFP4 requires the NHD KV layout.")
         MHATokenToKVPool._create_buffers(self)
+        self._active_slots = None
+        self._workspace_layer = None
+        self._preserve_current = False
+        self._current_kv = None
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.k_global_scale_buffer = [
                 torch.zeros(
@@ -60,11 +64,16 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
         )
 
     def _clear_buffers(self):
+        self._current_kv = None
+        self._active_slots = None
+        self._workspace_layer = None
         super()._clear_buffers()
         del self.k_global_scale_buffer
         del self.v_global_scale_buffer
 
     def move_kv_cache(self, tgt_loc, src_loc):
+        self._workspace_layer = None
+        self._current_kv = None
         for buffers in (
             self.k_buffer,
             self.v_buffer,
@@ -75,6 +84,19 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
         ):
             for buffer in buffers:
                 buffer[tgt_loc.long()] = buffer[src_loc.long()]
+
+    def prepare_forward(self, block_tables, seq_lens, *, preserve_current):
+        """Limit workspace reads to live pages of this attention batch."""
+        page_indices = torch.arange(block_tables.shape[1], device=block_tables.device)
+        valid = page_indices[None, :] * self.page_size < seq_lens[:, None]
+        # Shared radix prefixes can occur in several requests. Decode each
+        # physical page once so concurrent programs never race on workspace.
+        pages = block_tables[valid].long().unique(sorted=False)
+        offsets = torch.arange(self.page_size, device=block_tables.device)
+        self._active_slots = (pages[:, None] * self.page_size + offsets).flatten()
+        self._workspace_layer = None
+        self._preserve_current = preserve_current
+        self._current_kv = None
 
     def set_kv_buffer(
         self,
@@ -94,6 +116,7 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
         from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 
         loc, _, _ = unwrap_write_loc(loc_info)
+        self._workspace_layer = None
         self.quant_method.quantize_and_store(
             self.k_buffer[local_id],
             self.v_buffer[local_id],
@@ -107,18 +130,56 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
             k_global_scale_buffer=self.k_global_scale_buffer[local_id],
             v_global_scale_buffer=self.v_global_scale_buffer[local_id],
         )
+        if self._preserve_current:
+            # Attention on freshly computed prefill rows uses the model dtype.
+            # Only the persistent cache is quantized; cached prefixes still
+            # pass through the selected BF16/FP16 dequant workspace.
+            self._current_kv = (
+                layer_id,
+                loc.long(),
+                cache_k.reshape(-1, self.head_num, self.head_dim),
+                cache_v.reshape(-1, self.head_num, self.head_dim),
+            )
+
+    def _prepare_workspace(self, layer_id):
+        if self._workspace_layer == layer_id:
+            return
+        local_id = layer_id - self.start_layer
+        for data, scales, globals_, workspace in (
+            (
+                self.k_buffer,
+                self.k_scale_buffer,
+                self.k_global_scale_buffer,
+                self.dq_k_buffer,
+            ),
+            (
+                self.v_buffer,
+                self.v_scale_buffer,
+                self.v_global_scale_buffer,
+                self.dq_v_buffer,
+            ),
+        ):
+            if self._active_slots is None:
+                self.quant_method.dequantize_into(
+                    data[local_id], scales[local_id], globals_[local_id], workspace
+                )
+            else:
+                self.quant_method.dequantize_rows_into(
+                    data[local_id],
+                    scales[local_id],
+                    globals_[local_id],
+                    self._active_slots,
+                    workspace,
+                )
+        if self._current_kv is not None and self._current_kv[0] == layer_id:
+            _, slots, key, value = self._current_kv
+            self.dq_k_buffer[slots] = key.to(self.dq_k_buffer.dtype)
+            self.dq_v_buffer[slots] = value.to(self.dq_v_buffer.dtype)
+        self._workspace_layer = layer_id
 
     def _dequantized_view(self, *, layer_id, is_key):
-        local_id = layer_id - self.start_layer
-        data = self.k_buffer if is_key else self.v_buffer
-        scales = self.k_scale_buffer if is_key else self.v_scale_buffer
+        self._prepare_workspace(layer_id)
         workspace = self.dq_k_buffer if is_key else self.dq_v_buffer
-        global_scales = (
-            self.k_global_scale_buffer if is_key else self.v_global_scale_buffer
-        )
-        self.quant_method.dequantize_into(
-            data[local_id], scales[local_id], global_scales[local_id], workspace
-        )
         if self.use_fia:
             return workspace.view(-1, 1, self.head_num, self.head_dim)
         return workspace.view(-1, self.page_size, self.head_num, self.head_dim)

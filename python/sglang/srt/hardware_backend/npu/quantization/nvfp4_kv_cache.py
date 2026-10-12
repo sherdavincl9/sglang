@@ -143,6 +143,15 @@ class NPUNVFP4KVCacheMethod(NVFP4KVCacheMethod):
             (cache_v, v_buffer, v_scale_buffer, v_scale, v_global_scale_buffer),
         ):
             source = source.reshape(loc.numel(), *data.shape[1:-1], data.shape[-1] * 2)
+            if source.device.type == "npu" and not isinstance(
+                global_scale, torch.Tensor
+            ):
+                from sglang.kernels.ops.quantization import npu_nvfp4_quantize_store
+
+                npu_nvfp4_quantize_store(
+                    source, loc, data, scales, global_buffer, self._e4m3, global_scale
+                )
+                continue
             if global_scale is None:
                 global_scale = (
                     source.float().abs().amax(dim=(-2, -1), keepdim=True) / (6 * 448)
@@ -174,6 +183,19 @@ class NPUNVFP4KVCacheMethod(NVFP4KVCacheMethod):
                 self._dequantize(packed[start:end], scales[start:end], chunk_scale)
             )
         return workspace
+
+    def dequantize_rows_into(self, packed, scales, global_scale, slots, workspace):
+        if workspace.device.type == "npu":
+            from sglang.kernels.ops.quantization import npu_nvfp4_dequantize_rows
+
+            npu_nvfp4_dequantize_rows(
+                packed, scales, global_scale, slots, workspace, self._e4m3, self._e2m1
+            )
+        else:
+            for rows in slots.split(256):
+                workspace[rows] = self._dequantize(
+                    packed[rows], scales[rows], global_scale[rows]
+                ).to(workspace.dtype)
 
     def dequantize_prev_kv(self, k_fp4, k_scales, v_fp4, v_scales, layer_id):
         raise NotImplementedError(

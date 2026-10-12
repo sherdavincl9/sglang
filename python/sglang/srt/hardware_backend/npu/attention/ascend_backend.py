@@ -362,6 +362,15 @@ class AscendAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        from sglang.srt.hardware_backend.npu.nvfp4_memory_pool import (
+            NPUNVFP4TokenToKVPool,
+        )
+
+        self.nvfp4_pool = (
+            self.token_to_kv_pool
+            if isinstance(self.token_to_kv_pool, NPUNVFP4TokenToKVPool)
+            else None
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -591,6 +600,12 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        if self.nvfp4_pool is not None:
+            self.nvfp4_pool.prepare_forward(
+                self.forward_metadata.block_tables,
+                self.forward_metadata.seq_lens,
+                preserve_current=forward_batch.forward_mode.is_extend(),
+            )
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
         # only rebind the Host-side IntArray when captured as a Python list.
