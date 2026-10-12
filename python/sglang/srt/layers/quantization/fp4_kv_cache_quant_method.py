@@ -1047,6 +1047,17 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
 
 def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethodBase:
     """Instantiate a KVCacheQuantMethodBase by internal method name."""
+    if name == "nvfp4" and str(kwargs.get("device", "")).startswith("npu"):
+        from sglang.srt.hardware_backend.npu.quantization.nvfp4_kv_cache import (
+            NPUNVFP4KVCacheMethod,
+        )
+        from sglang.srt.runtime_context import get_exec
+
+        workspace_dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[get_exec().kernel.prefill_kv_cache_dequant_dtype]
+        return NPUNVFP4KVCacheMethod(workspace_dtype=workspace_dtype, **kwargs)
     if name not in KV_CACHE_QUANT_REGISTRY:
         raise ValueError(
             f"Unknown KV cache quantization method: '{name}'. "

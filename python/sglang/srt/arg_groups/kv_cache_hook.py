@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,14 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                 "--kv-cache-dtype=nvfp4."
             )
         return
+
+    if get_platform().is_npu:
+        _handle_npu_nvfp4_prefill_dtype(server_args)
+        return
+    if requested_dtype in ("bf16", "fp16"):
+        raise ValueError(
+            "BF16/FP16 NVFP4 dequant workspaces are currently supported only on NPU."
+        )
 
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
@@ -97,6 +105,88 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     )
 
 
+def _handle_npu_nvfp4_prefill_dtype(server_args: Any) -> None:
+    from sglang.srt.configs.model_config import is_minimax_sparse
+
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if (
+        use_mla_backend(server_args)
+        or mambaish_config(model_config) is not None
+        or is_minimax_sparse(model_config.hf_config)
+    ):
+        raise ValueError("NPU NVFP4 currently supports dense MHA models only.")
+    if model_config.is_hybrid_swa:
+        raise ValueError("NPU NVFP4 does not yet support hybrid SWA KV pools.")
+    model_dtype = str(model_config.dtype)
+    workspace_dtype = {"torch.bfloat16": "bf16", "torch.float16": "fp16"}.get(
+        model_dtype
+    )
+    requested = cfg.prefill_kv_cache_dequant_dtype
+    if requested == "auto":
+        requested = workspace_dtype
+    if requested not in ("bf16", "fp16"):
+        raise ValueError(
+            "NPU NVFP4 requires --prefill-kv-cache-dequant-dtype=auto, bf16 or fp16; "
+            "native NVFP4 and FP8 attention inputs are not supported."
+        )
+    if requested != workspace_dtype:
+        raise ValueError(
+            f"NPU NVFP4 {requested} workspace must match the model dtype "
+            f"({model_dtype}); set --dtype to bfloat16 or float16 accordingly."
+        )
+    if any(
+        backend not in (None, "ascend")
+        for backend in (
+            cfg.attention_backend,
+            cfg.prefill_attention_backend,
+            cfg.decode_attention_backend,
+            server_args.attention_backend,
+            server_args.prefill_attention_backend,
+            server_args.decode_attention_backend,
+        )
+    ):
+        raise ValueError("NPU NVFP4 requires the ascend attention backend.")
+    if (
+        cfg.speculative_algorithm is not None
+        or cfg.disaggregation_mode != "null"
+        or cfg.enable_hierarchical_cache
+        or cfg.enable_lmcache
+        or cfg.enable_flexkv
+        or cfg.enable_unified_memory
+        or cfg.enable_page_major_kv_layout
+        or cfg.attn_cp_size > 1
+        or cfg.dcp_size > 1
+        or cfg.enable_kv_cache_sharding
+        or cfg.enable_two_batch_overlap
+        or cfg.enable_single_batch_overlap
+        or cfg.enable_torch_compile
+        or cfg.prefill_only_disable_kv_cache
+    ):
+        raise ValueError(
+            "NPU NVFP4 currently supports monolithic MHA without speculative decoding, "
+            "KV offload/transfer, unified/page-major pools, CP, KV sharding or TBO."
+        )
+    graph_config = cfg.cuda_graph_config
+    for phase in Phase.ALL:
+        graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
+    declare_resolution(
+        server_args,
+        "_handle_nvfp4_prefill_kv_dequant_dtype",
+        prefill_kv_cache_dequant_dtype=requested,
+        attention_backend="ascend",
+        prefill_attention_backend="ascend",
+        decode_attention_backend="ascend",
+        cuda_graph_config=graph_config,
+        disable_overlap_schedule=True,
+    )
+    logger.warning(
+        "NPU NVFP4 uses software dequantization to a shared %s workspace for "
+        "prefill and decode; graph capture and overlap scheduling are disabled.",
+        requested,
+    )
+
+
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
     cfg = resolving_view(server_args)
@@ -115,6 +205,9 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
+        return
+
+    if get_platform().is_npu and cfg.kv_cache_dtype == "nvfp4":
         return
 
     uses_mla = use_mla_backend(server_args)

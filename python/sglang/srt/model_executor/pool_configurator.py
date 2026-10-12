@@ -462,7 +462,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
 
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if is_float4_e2m1fn_x2(kv_cache_dtype) or (
+                _is_npu and kvc.kv_cache_dtype_str == "nvfp4"
+            ):
                 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
                     get_kv_cache_quant_method,
                     resolve_kv_cache_quant,

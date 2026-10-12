@@ -161,9 +161,13 @@ class ExecKernel(msgspec.Struct):
                 "without additional dequantization; 'fp8_e4m3' dequantizes it "
                 "into a temporary FP8 workspace. This does not change the stored "
                 "KV-cache dtype. 'auto' selects NVFP4 without additional "
-                "dequantization on SM100 and FP8 E4M3 otherwise."
+                "dequantization on SM100 and FP8 E4M3 on other CUDA devices. "
+                "On NPU, 'auto' selects the model's BF16/FP16 dtype; 'bf16' "
+                "and 'fp16' select a software dequant workspace for both prefill "
+                "and decode and must match --dtype. NPU software NVFP4 currently "
+                "supports dense MHA with eager execution only."
             ),
-            choices=["auto", "nvfp4", "fp8_e4m3"],
+            choices=["auto", "nvfp4", "fp8_e4m3", "bf16", "fp16"],
             resolvable=True,
         ),
     ] = "auto"

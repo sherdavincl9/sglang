@@ -388,7 +388,10 @@ class KVCacheConfigurator:
         self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
 
     def _build_fp4_quant_method(self, *, num_layers: int):
-        if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
+        if not (
+            is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            or (_is_npu and self.kv_cache_dtype_str == "nvfp4")
+        ):
             return None
         quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
         if quant_name is None:
@@ -1982,7 +1985,18 @@ class KVCacheConfigurator:
             NPUMHATokenToKVPool,
         )
 
-        token_to_kv_pool = NPUMHATokenToKVPool(
+        pool_cls = NPUMHATokenToKVPool
+        pool_kwargs = {}
+        if self.kv_cache_dtype_str == "nvfp4":
+            from sglang.srt.hardware_backend.npu.nvfp4_memory_pool import (
+                NPUNVFP4TokenToKVPool,
+            )
+
+            pool_cls = NPUNVFP4TokenToKVPool
+            pool_kwargs["quant_method"] = self._build_fp4_quant_method(
+                num_layers=self.layer_info.num_effective_layers
+            )
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1995,6 +2009,8 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            v_head_dim=self.model_config.v_head_dim,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
