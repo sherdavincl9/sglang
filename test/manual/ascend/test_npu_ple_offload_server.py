@@ -53,6 +53,7 @@ from sglang.test.test_utils import (
 MODEL = os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
 TP_SIZE = "8"
 EXTRA_ARGS = ["--mamba-ssm-dtype", "bfloat16"]
+SERVER_LAUNCH_TIMEOUT = max(1800, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
 
 TABLE_FILE = re.compile(
     r"^ple_table_(?P<dims>[0-9x]+)_(?P<dtype>[a-z0-9_]+)_(?P<nbytes>\d+)B"
@@ -260,6 +261,10 @@ class TestNpuPleOffloadServer(CustomTestCase):
             TP_SIZE,
             "--mem-fraction-static",
             "0.85",
+            # These functional requests run singly or with four-way concurrency.
+            # Keep decode graphs enabled without capturing 52 A5 default sizes.
+            "--cuda-graph-max-bs-decode",
+            "4",
             *EXTRA_ARGS,
         ]
 
@@ -295,7 +300,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
             self.process = popen_launch_server(
                 MODEL,
                 self.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                timeout=SERVER_LAUNCH_TIMEOUT,
                 other_args=args,
                 env=env,
                 return_stdout_stderr=(self.stdout, self.stderr),
