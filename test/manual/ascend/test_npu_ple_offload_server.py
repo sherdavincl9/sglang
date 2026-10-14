@@ -21,19 +21,21 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import requests
 import sympy
 import torch
-
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     pad_vocab_size,
@@ -45,7 +47,6 @@ from sglang.srt.utils.hf_transformers import get_config
 from sglang.test.ascend.test_ascend_utils import MODEL_WEIGHTS_DIR
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
@@ -53,6 +54,47 @@ from sglang.test.test_utils import (
 MODEL = os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
 TP_SIZE = "8"
 EXTRA_ARGS = ["--mamba-ssm-dtype", "bfloat16"]
+
+
+def local_test_url(requested_url=None):
+    """Use a free loopback port, or reject an occupied explicit test port."""
+    parsed = urlsplit(requested_url or "http://127.0.0.1:0")
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in ("127.0.0.1", "localhost")
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("PLE test URL must be a local http://127.0.0.1:<port> URL")
+    port = parsed.port or 0
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"PLE test port {port} is unavailable; an existing service must "
+                "not be mistaken for the test server."
+            ) from exc
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+@contextlib.contextmanager
+def bypass_local_proxy():
+    # The shared launch helper creates its own requests.Session; make its
+    # loopback health probe direct without changing that shared utility.
+    values = {}
+    for key in ("NO_PROXY", "no_proxy"):
+        current = os.environ.get(key, "")
+        values[key] = ",".join(
+            part for part in (current, "127.0.0.1", "localhost") if part
+        )
+    with patch.dict(os.environ, values):
+        yield
+
 
 TABLE_FILE = re.compile(
     r"^ple_table_(?P<dims>[0-9x]+)_(?P<dtype>[a-z0-9_]+)_(?P<nbytes>\d+)B"
@@ -213,11 +255,17 @@ class TestNpuPleOffloadServer(CustomTestCase):
             raise FileNotFoundError(
                 f"Model weights not found in shared directory: {MODEL}"
             )
-        cls.base_url = os.environ.get("SGLANG_TEST_PLE_URL", DEFAULT_URL_FOR_TEST)
+        cls.requested_url = os.environ.get("SGLANG_TEST_PLE_URL")
 
     def setUp(self):
         self.process = None
         self.owns_process_group = False
+        self.base_url = local_test_url(self.requested_url)
+        self.server_name = f"ple-functional-test-{uuid.uuid4().hex}"
+        self.http = requests.Session()
+        self.http.trust_env = False
+        self.addCleanup(self.http.close)
+        print(f"PLE test endpoint: {self.base_url}", flush=True)
         self.work_dir = tempfile.mkdtemp(prefix="ple_server_test_")
         self.addCleanup(shutil.rmtree, self.work_dir, ignore_errors=True)
         self.table_dir = os.path.join(self.work_dir, "tables")
@@ -260,6 +308,8 @@ class TestNpuPleOffloadServer(CustomTestCase):
             TP_SIZE,
             "--mem-fraction-static",
             "0.85",
+            "--served-model-name",
+            self.server_name,
             *EXTRA_ARGS,
         ]
 
@@ -291,7 +341,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
                 if part
             )
         }
-        with self.isolated_cache():
+        with self.isolated_cache(), bypass_local_proxy():
             self.process = popen_launch_server(
                 MODEL,
                 self.base_url,
@@ -300,20 +350,30 @@ class TestNpuPleOffloadServer(CustomTestCase):
                 env=env,
                 return_stdout_stderr=(self.stdout, self.stderr),
             )
+        self.server_info()
 
     def log(self):
         return self.stdout.getvalue() + "\n" + self.stderr.getvalue()
 
     def server_info(self):
-        response = requests.get(f"{self.base_url}/server_info", timeout=30)
+        response = self.http.get(f"{self.base_url}/server_info", timeout=30)
         self.assertEqual(response.status_code, 200)
-        return response.json()
+        info = response.json()
+        self.assertEqual(
+            info.get("served_model_name"),
+            self.server_name,
+            f"{self.base_url} responded from a different server: "
+            f"model={info.get('model_path')!r}, "
+            f"PLE={info.get('ple_offload_embedding')!r}. "
+            "Check port ownership; this is not a PLE functionality result.",
+        )
+        return info
 
     def generate(self, prompt, *, force_decode=True):
         params = {"temperature": 0.0, "max_new_tokens": 16}
         if force_decode:
             params["ignore_eos"] = True
-        response = requests.post(
+        response = self.http.post(
             f"{self.base_url}/generate",
             json={"text": prompt, "sampling_params": params},
             timeout=120,
