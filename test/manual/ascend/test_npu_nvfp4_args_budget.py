@@ -116,6 +116,46 @@ class TestNPUNVFP4Args(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "only on NPU"):
                 handle_nvfp4_prefill_kv_dequant_dtype(args)
 
+    @override_platform(is_npu=True, is_cuda=False)
+    def test_npu_nvfp4_rejects_encoder_decoder_workspace(self):
+        import torch
+        from transformers import Qwen3Config
+
+        model_config = SimpleNamespace(
+            hf_config=Qwen3Config(),
+            dtype=torch.bfloat16,
+            is_hybrid_swa=False,
+            is_encoder_decoder=True,
+            linear_attn_registry_result=None,
+        )
+        args = self._make_unrouted_nvfp4_args()
+        with patch(
+            "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+            return_value=model_config,
+        ):
+            with self.assertRaisesRegex(ValueError, "separate encoder KV workspace"):
+                handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_npu=True, is_cuda=False)
+    def test_npu_nvfp4_rejects_mixed_prefill_decode_batches(self):
+        import torch
+        from transformers import Qwen3Config
+
+        model_config = SimpleNamespace(
+            hf_config=Qwen3Config(),
+            dtype=torch.bfloat16,
+            is_hybrid_swa=False,
+            is_encoder_decoder=False,
+            linear_attn_registry_result=None,
+        )
+        args = self._make_unrouted_nvfp4_args(enable_mixed_chunk=True)
+        with patch(
+            "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+            return_value=model_config,
+        ):
+            with self.assertRaisesRegex(ValueError, "--enable-mixed-chunk"):
+                handle_nvfp4_prefill_kv_dequant_dtype(args)
+
 
 class TestNPUNVFP4Budget(CustomTestCase):
     def test_npu_nvfp4_prices_global_scales_and_shared_workspace(self):

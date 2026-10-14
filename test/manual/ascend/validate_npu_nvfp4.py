@@ -95,12 +95,26 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
         "42",
     ]
     output = Path(args.output_dir)
-    (output / f"{name}.command.json").write_text(json.dumps(command, indent=2))
-    (output / f"{name}.command.sh").write_text(
+    commands = Path(args.command_dir or args.output_dir)
+    commands.mkdir(parents=True, exist_ok=True)
+    environment = {
+        key: os.environ.get(key)
+        for key in ("PYTHONPATH", "ASCEND_RT_VISIBLE_DEVICES", "ASCEND_USE_FIA")
+    }
+    (commands / f"{name}.environment.json").write_text(
+        json.dumps(environment, indent=2)
+    )
+    (commands / f"{name}.command.json").write_text(json.dumps(command, indent=2))
+    (commands / f"{name}.command.sh").write_text(
         "#!/bin/bash\nset -eu\n"
         + f"cd {shlex.quote(os.getcwd())}\n"
         + f"export PYTHONPATH={shlex.quote(os.environ['PYTHONPATH'])}\n"
         + f"export ASCEND_RT_VISIBLE_DEVICES={shlex.quote(os.environ['ASCEND_RT_VISIBLE_DEVICES'])}\n"
+        + (
+            f"export ASCEND_USE_FIA={shlex.quote(environment['ASCEND_USE_FIA'])}\n"
+            if environment["ASCEND_USE_FIA"] is not None
+            else "unset ASCEND_USE_FIA\n"
+        )
         + "source /usr/local/Ascend/ascend-toolkit/set_env.sh\n"
         + "exec "
         + shlex.join(command)
@@ -109,6 +123,7 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
         + " 2>&1\n"
     )
     with (output / f"{name}.server.log").open("w") as log:
+        print(f"START {name}, environment={environment}", flush=True)
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
@@ -133,6 +148,7 @@ def run_case(args, *, name, dtype, kv_dtype, workspace):
             assert cold["meta_info"]["prompt_tokens"] > 256, cold
             assert warm["meta_info"]["cached_tokens"] >= 256, warm
             evidence = {
+                "environment": environment,
                 "server_info": info,
                 "first": first,
                 "repeat": repeat,
@@ -183,6 +199,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="/home/weights/Qwen3-0.6B")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--command-dir", help="Save launch commands separately from logs"
+    )
     parser.add_argument("--port", type=int, default=31884)
     parser.add_argument(
         "--cases",

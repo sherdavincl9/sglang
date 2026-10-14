@@ -32,7 +32,7 @@ class NPUNVFP4KVCacheMethod(NVFP4KVCacheMethod):
             .to(self.device)
         )
         self._e2m1 = torch.tensor(
-            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
             dtype=torch.float32,
             device=self.device,
         )
@@ -138,6 +138,8 @@ class NPUNVFP4KVCacheMethod(NVFP4KVCacheMethod):
         v_global_scale_buffer,
     ):
         loc = loc.long()
+        if loc.numel() == 0:
+            return
         for source, data, scales, global_scale, global_buffer in (
             (cache_k, k_buffer, k_scale_buffer, k_scale, k_global_scale_buffer),
             (cache_v, v_buffer, v_scale_buffer, v_scale, v_global_scale_buffer),
@@ -185,6 +187,8 @@ class NPUNVFP4KVCacheMethod(NVFP4KVCacheMethod):
         return workspace
 
     def dequantize_rows_into(self, packed, scales, global_scale, slots, workspace):
+        if slots.numel() == 0:
+            return
         if workspace.device.type == "npu":
             from sglang.kernels.ops.quantization import npu_nvfp4_dequantize_rows
 

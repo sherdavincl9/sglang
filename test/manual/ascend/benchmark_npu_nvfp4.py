@@ -12,6 +12,7 @@ import torch_npu  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.nvfp4_kv_cache import (
     NPUNVFP4KVCacheMethod,
 )
+from test_npu_nvfp4_reference import reference_quantize
 
 
 def measure(fn, repeats=8):
@@ -71,7 +72,9 @@ def main():
             global_scale = (
                 source.float().abs().amax((-2, -1), keepdim=True) / 2688
             ).clamp_min(2**-126)
-            expected_data, expected_scales = method._quantize(source, global_scale)
+            expected_data, expected_scales = reference_quantize(
+                source.cpu(), global_scale.cpu()
+            )
 
             def reference():
                 g = (
@@ -102,7 +105,7 @@ def main():
             workspace = torch.empty(source.shape, dtype=dtype, device="npu")
             method.dequantize_rows_into(packed, scales, globals_, loc, workspace)
             expected_values = method._dequantize(
-                expected_data, expected_scales, global_scale
+                expected_data.npu(), expected_scales.npu(), global_scale
             ).to(dtype)
             torch.testing.assert_close(
                 workspace.cpu(), expected_values.cpu(), rtol=0, atol=0

@@ -28,6 +28,68 @@ def _encode_e4m3(value):
 
 
 @triton.jit
+def _divide_with_residual(value, denominator):
+    """Correct division error before discontinuous FP4 rounding decisions.
+
+    Split each FP32 significand into two 12-bit parts to recover the product
+    residual without relying on Ascend's FMA lowering. FP fusion must stay off.
+    """
+    quotient = tl.div_rn(value, denominator)
+    denominator = denominator + tl.full(value.shape, 0, tl.float32)
+    quotient_hi = (quotient.to(tl.int32, bitcast=True) & -4096).to(
+        tl.float32, bitcast=True
+    )
+    denominator_hi = (denominator.to(tl.int32, bitcast=True) & -4096).to(
+        tl.float32, bitcast=True
+    )
+    quotient_lo = quotient - quotient_hi
+    denominator_lo = denominator - denominator_hi
+    product = quotient * denominator
+    error = (
+        ((quotient_hi * denominator_hi - product) + quotient_hi * denominator_lo)
+        + quotient_lo * denominator_hi
+    ) + quotient_lo * denominator_lo
+    residual = (value - product) - error
+    corrected = quotient + tl.div_rn(residual, denominator)
+    finite_correction = (tl.abs(product) < float("inf")) & (
+        tl.abs(corrected) < float("inf")
+    )
+    return tl.where(finite_correction, corrected, quotient)
+
+
+@triton.jit
+def _global_scale_kernel(
+    SOURCE,
+    LOC,
+    GLOBALS,
+    ROW_STRIDE: tl.constexpr,
+    HEAD_STRIDE: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+    B: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, B)
+    maximum = tl.full((B,), 0, tl.float32)
+    # Bound the reduction scratch independently of head count. In particular,
+    # do not materialize a padded [heads, dim] FP32 token in Ascend's UB.
+    for tile in range(tl.cdiv(N, B)):
+        linear = tile * B + offsets
+        value = tl.load(
+            SOURCE + token * ROW_STRIDE + (linear // D) * HEAD_STRIDE + linear % D,
+            linear < N,
+            0,
+        ).to(tl.float32)
+        maximum = tl.maximum(maximum, tl.abs(value))
+    # Avoid scalar RN-divide lowering after a reduction on Ascend. Division by
+    # a positive constant is monotone, so moving it before max preserves bits.
+    scaled = tl.maximum(tl.div_rn(maximum, 2688.0), 2.0**-126)
+    scale = tl.max(scaled, 0)
+    slot = tl.load(LOC + token).to(tl.int32)
+    tl.store(GLOBALS + slot, scale)
+
+
+@triton.jit
 def _quantize_store_kernel(
     SOURCE,
     LOC,
@@ -55,20 +117,22 @@ def _quantize_store_kernel(
         global_scale = tl.load(GLOBALS + tl.load(LOC + token).to(tl.int32))
     else:
         global_scale = GLOBAL
-    normalized = tl.div_rn(value, global_scale)
+    normalized = _divide_with_residual(value, global_scale)
     blocks = tl.reshape(normalized, (B // 16, 16))
-    scale_code = _encode_e4m3(tl.max(tl.abs(blocks), 1) / 6.0)
+    scale_code = _encode_e4m3(_divide_with_residual(tl.max(tl.abs(blocks), 1), 6.0))
     scale = tl.load(E4M3 + scale_code)
-    scaled = tl.div_rn(blocks, tl.maximum(scale[:, None], 0.001953125))
-    magnitude = tl.abs(scaled)
-    code = (magnitude > 0.25).to(tl.int32)
-    code += (magnitude >= 0.75).to(tl.int32)
-    code += (magnitude > 1.25).to(tl.int32)
-    code += (magnitude >= 1.75).to(tl.int32)
-    code += (magnitude > 2.5).to(tl.int32)
-    code += (magnitude >= 3.5).to(tl.int32)
-    code += (magnitude > 5.0).to(tl.int32)
-    code += (scaled < 0).to(tl.int32) * 8
+    scale = tl.maximum(scale[:, None], 0.001953125)
+    magnitude = tl.abs(blocks)
+    # E4M3 scale * E2M1 midpoint is exact in FP32. Cross-multiplication
+    # preserves CPU's RN/ties-to-even classification without another divide.
+    code = (magnitude > scale * 0.25).to(tl.int32)
+    code += (magnitude >= scale * 0.75).to(tl.int32)
+    code += (magnitude > scale * 1.25).to(tl.int32)
+    code += (magnitude >= scale * 1.75).to(tl.int32)
+    code += (magnitude > scale * 2.5).to(tl.int32)
+    code += (magnitude >= scale * 3.5).to(tl.int32)
+    code += (magnitude > scale * 5.0).to(tl.int32)
+    code += (blocks < 0).to(tl.int32) * 8
     # Ascend's gather supports floating values; all FP4 codes are exact FP32.
     code = tl.reshape(code, (B,)).to(tl.float32)
     even = tl.arange(0, B // 2) * 2
@@ -155,11 +219,19 @@ def quantize_store(source, loc, data, scales, globals_, e4m3, global_scale=None)
     loc = loc.contiguous()
     if loc.numel():
         if global_scale is None:
-            # Match PyTorch's FP32 global-scale rounding before FP4 tie tests.
-            # Quantization and scattering of block data remain fused below.
-            globals_[loc] = (
-                source.float().abs().amax((-2, -1), keepdim=True) / 2688.0
-            ).clamp_min(2**-126)
+            # Keep FP32 RN division at FP4 tie boundaries while avoiding the
+            # cast/abs/reduce/divide/clamp/scatter Torch launches and scratch.
+            _global_scale_kernel[(loc.numel(),)](
+                source,
+                loc,
+                globals_,
+                source.stride(0),
+                source.stride(1),
+                source.shape[2],
+                n,
+                min(triton.next_power_of_2(n), 1024),
+                enable_fp_fusion=False,
+            )
         _quantize_store_kernel[(loc.numel(), data.shape[1])](
             source,
             loc,

@@ -118,6 +118,16 @@ def _handle_npu_nvfp4_prefill_dtype(server_args: Any) -> None:
         raise ValueError("NPU NVFP4 currently supports dense MHA models only.")
     if model_config.is_hybrid_swa:
         raise ValueError("NPU NVFP4 does not yet support hybrid SWA KV pools.")
+    if getattr(model_config, "is_encoder_decoder", False):
+        raise ValueError(
+            "NPU NVFP4 does not yet support encoder-decoder models: "
+            "cross-attention requires a separate encoder KV workspace."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "NPU NVFP4 does not yet support --enable-mixed-chunk; "
+            "use separate prefill and decode batches."
+        )
     model_dtype = str(model_config.dtype)
     workspace_dtype = {"torch.bfloat16": "bf16", "torch.float16": "fp16"}.get(
         model_dtype

@@ -605,6 +605,8 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.block_tables,
                 self.forward_metadata.seq_lens,
                 preserve_current=forward_batch.forward_mode.is_extend(),
+                prefix_lens=forward_batch.extend_prefix_lens,
+                prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can

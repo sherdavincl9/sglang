@@ -85,15 +85,53 @@ class NPUNVFP4TokenToKVPool(NPUMHATokenToKVPool):
             for buffer in buffers:
                 buffer[tgt_loc.long()] = buffer[src_loc.long()]
 
-    def prepare_forward(self, block_tables, seq_lens, *, preserve_current):
+    def prepare_forward(
+        self,
+        block_tables,
+        seq_lens,
+        *,
+        preserve_current,
+        prefix_lens=None,
+        prefix_lens_cpu=None,
+    ):
         """Limit workspace reads to live pages of this attention batch."""
-        page_indices = torch.arange(block_tables.shape[1], device=block_tables.device)
-        valid = page_indices[None, :] * self.page_size < seq_lens[:, None]
-        # Shared radix prefixes can occur in several requests. Decode each
-        # physical page once so concurrent programs never race on workspace.
-        pages = block_tables[valid].long().unique(sorted=False)
-        offsets = torch.arange(self.page_size, device=block_tables.device)
-        self._active_slots = (pages[:, None] * self.page_size + offsets).flatten()
+        if preserve_current and prefix_lens is not None:
+            # Fresh prefill rows are copied in model precision below. Decode
+            # only historical rows, including the exact part of a shared tail
+            # page; never decode fresh/padded rows just to overwrite them.
+            max_prefix = (
+                max(prefix_lens_cpu, default=0)
+                if prefix_lens_cpu is not None
+                else block_tables.shape[1] * self.page_size
+            )
+            num_pages = (max_prefix + self.page_size - 1) // self.page_size
+            if num_pages == 0:
+                self._active_slots = torch.empty(
+                    0, dtype=torch.int64, device=block_tables.device
+                )
+            else:
+                positions = torch.arange(
+                    num_pages * self.page_size, device=block_tables.device
+                )
+                physical = (
+                    block_tables[:, :num_pages, None] * self.page_size
+                    + positions[: self.page_size][None, None, :]
+                ).flatten(1)
+                self._active_slots = (
+                    physical[positions[None, :] < prefix_lens[:, None]]
+                    .long()
+                    .unique(sorted=False)
+                )
+        else:
+            page_indices = torch.arange(
+                block_tables.shape[1], device=block_tables.device
+            )
+            valid = page_indices[None, :] * self.page_size < seq_lens[:, None]
+            # Shared radix prefixes can occur in several requests. Decode each
+            # physical page once so concurrent programs never race on workspace.
+            pages = block_tables[valid].long().unique(sorted=False)
+            offsets = torch.arange(self.page_size, device=block_tables.device)
+            self._active_slots = (pages[:, None] * self.page_size + offsets).flatten()
         self._workspace_layer = None
         self._preserve_current = preserve_current
         self._current_kv = None
