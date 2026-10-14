@@ -18,11 +18,17 @@ Not covered here:
   - Device memory saved by the offload. Read it from the loader's
     "PLE table: ..." line and the reported KV pool size.
 
-Run: python3 test/manual/ascend/test_npu_ple_offload_server.py -v
+Run: python3 test/manual/ascend/test_npu_ple_offload_server.py
+
+The defaults below select TP8 and BF16 Mamba state. The test raises the
+memlock limit before a pinned launch, and automatically runs both pinned
+and file service tests. Model paths come from test_ascend_utils.
 """
 
 import os
 import re
+import resource
+import shlex
 import shutil
 import tempfile
 import unittest
@@ -38,7 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.models.qwen4_exp_ple_table import ple_table_file_name
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_config
-from sglang.test.ascend.test_ascend_utils import MODEL_WEIGHTS_DIR
+from sglang.test.ascend.test_ascend_utils import QWEN3_8_FLASH_NEXT_WEIGHTS_PATH
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -46,11 +52,32 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-MODEL = os.environ.get(
-    "SGLANG_TEST_PLE_MODEL",
-    os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.8-Flash-Next"),
+# Defaults for running this file directly with python3. Optional environment
+# overrides remain available for existing runners; no exports are required.
+MODEL = os.environ.get("SGLANG_TEST_PLE_MODEL", QWEN3_8_FLASH_NEXT_WEIGHTS_PATH)
+TP_SIZE = os.environ.get("SGLANG_TEST_PLE_TP_SIZE", "8")
+# Match the BF16 state used by the A3 PLE validation; A3 cannot use FP32 state.
+EXTRA_ARGS = shlex.split(
+    os.environ.get("SGLANG_TEST_PLE_EXTRA_ARGS", "--mamba-ssm-dtype bfloat16")
 )
-TP_SIZE = os.environ.get("SGLANG_TEST_PLE_TP_SIZE", "4")
+
+
+def ensure_pinned_memory_limit():
+    """Set the inherited memlock limit before spawning a pinned PLE server."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft == resource.RLIM_INFINITY:
+        return
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot raise the locked-memory limit for pinned PLE "
+            f"(soft={soft}, hard={hard} bytes). The test sets the limit itself, "
+            "but the host/container must permit unlimited memlock."
+        ) from exc
+
 
 # ple_table_<dims>_<dtype>_<bytes>B_rows<start>-<end>.bin
 TABLE_FILE = re.compile(
@@ -108,8 +135,13 @@ class TestNpuPleOffloadServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not os.path.isdir(MODEL):
-            raise unittest.SkipTest(f"model weights not found: {MODEL}")
-        cls.base_url = DEFAULT_URL_FOR_TEST
+            raise FileNotFoundError(
+                f"model weights not found: {MODEL}; configure the shared "
+                "QWEN3_8_FLASH_NEXT_WEIGHTS_PATH in test_ascend_utils"
+            )
+        # The default port is derived from CUDA_VISIBLE_DEVICES and collides with
+        # other jobs on a shared NPU box; SGLANG_TEST_PLE_URL moves it.
+        cls.base_url = os.environ.get("SGLANG_TEST_PLE_URL", DEFAULT_URL_FOR_TEST)
 
     def setUp(self):
         self.process = None
@@ -121,6 +153,8 @@ class TestNpuPleOffloadServer(CustomTestCase):
             kill_process_tree(self.process.pid)
 
     def launch(self, backend, extra_args=None, logs=None):
+        if backend == "pinned":
+            ensure_pinned_memory_limit()
         args = [
             "--trust-remote-code",
             "--attention-backend",
@@ -135,6 +169,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
         ]
         if backend == "file":
             args += ["--ple-offload-dir", self.table_dir]
+        args += EXTRA_ARGS
         args += extra_args or []
         self.process = popen_launch_server(
             MODEL,
@@ -144,7 +179,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
             return_stdout_stderr=logs,
         )
 
-    def generate(self, prompt, max_new_tokens=32):
+    def generate_response(self, prompt, max_new_tokens=32):
         response = requests.post(
             f"{self.base_url}/generate",
             json={
@@ -161,7 +196,10 @@ class TestNpuPleOffloadServer(CustomTestCase):
             200,
             f"Request failed: {response.status_code} - {response.text}",
         )
-        return response.json()["text"]
+        return response.json()
+
+    def generate(self, prompt, max_new_tokens=32):
+        return self.generate_response(prompt, max_new_tokens)["text"]
 
     def server_info(self):
         return requests.get(f"{self.base_url}/server_info", timeout=30).json()
@@ -177,8 +215,11 @@ class TestNpuPleOffloadServer(CustomTestCase):
         # Smoke only: a grossly wrong mapping breaks the answer, a subtle one may not.
         self.assertIn("Paris", self.generate("The capital of France is"))
 
-        # Prefill sizes drive a different lookup width than decode does.
-        self.assertTrue(self.generate("Count from one to twenty: " * 64))
+        # Prefill sizes drive a different lookup width than decode does. This
+        # checkpoint can emit EOS immediately, including without offload.
+        wide = self.generate_response("Count from one to twenty: " * 64)
+        self.assertTrue(wide["output_ids"])
+        self.assertGreaterEqual(wide["meta_info"]["completion_tokens"], 1)
 
     def test_pinned_backend_serves(self):
         self.launch("pinned")
@@ -252,4 +293,4 @@ class TestNpuPleOffloadServer(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
