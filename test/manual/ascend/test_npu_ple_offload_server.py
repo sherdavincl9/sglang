@@ -28,7 +28,6 @@ and file service tests. Model paths come from test_ascend_utils.
 import os
 import re
 import resource
-import shlex
 import shutil
 import tempfile
 import unittest
@@ -52,16 +51,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Defaults for running this file directly with python3. Optional environment
-# overrides remain available for existing runners; no exports are required.
-MODEL = os.environ.get(
-    "SGLANG_TEST_PLE_MODEL", os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
-)
-TP_SIZE = os.environ.get("SGLANG_TEST_PLE_TP_SIZE", "8")
+# Run this file directly with python3 using the existing shared model directory.
+MODEL = os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
+TP_SIZE = "8"
 # Match the BF16 state used by the A3 PLE validation; A3 cannot use FP32 state.
-EXTRA_ARGS = shlex.split(
-    os.environ.get("SGLANG_TEST_PLE_EXTRA_ARGS", "--mamba-ssm-dtype bfloat16")
-)
+EXTRA_ARGS = ["--mamba-ssm-dtype", "bfloat16"]
 
 
 def ensure_pinned_memory_limit():
