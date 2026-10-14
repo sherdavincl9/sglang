@@ -44,7 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.models.qwen4_exp_ple_table import ple_table_file_name
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_config
-from sglang.test.ascend.test_ascend_utils import QWEN3_8_FLASH_NEXT_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import MODEL_WEIGHTS_DIR
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -54,7 +54,9 @@ from sglang.test.test_utils import (
 
 # Defaults for running this file directly with python3. Optional environment
 # overrides remain available for existing runners; no exports are required.
-MODEL = os.environ.get("SGLANG_TEST_PLE_MODEL", QWEN3_8_FLASH_NEXT_WEIGHTS_PATH)
+MODEL = os.environ.get(
+    "SGLANG_TEST_PLE_MODEL", os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
+)
 TP_SIZE = os.environ.get("SGLANG_TEST_PLE_TP_SIZE", "8")
 # Match the BF16 state used by the A3 PLE validation; A3 cannot use FP32 state.
 EXTRA_ARGS = shlex.split(
@@ -136,8 +138,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
     def setUpClass(cls):
         if not os.path.isdir(MODEL):
             raise FileNotFoundError(
-                f"model weights not found: {MODEL}; configure the shared "
-                "QWEN3_8_FLASH_NEXT_WEIGHTS_PATH in test_ascend_utils"
+                f"model weights not found: {MODEL}; check the shared model directory"
             )
         # The default port is derived from CUDA_VISIBLE_DEVICES and collides with
         # other jobs on a shared NPU box; SGLANG_TEST_PLE_URL moves it.
