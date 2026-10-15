@@ -1,4 +1,4 @@
-"""PLE GSM8K: 5-shot completion, 1314 scored questions; run with python3."""
+"""PLE GSM8K: 5-shot completion, 20 scored questions; run with python3."""
 
 import json
 import os
@@ -33,6 +33,7 @@ MODEL = os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
 BACKEND = "pinned"  # Change to "file" to evaluate that backend.
 MIN_ACCURACY = 0.95  # Reference CI gate, not a Qwen model-card score.
 MAX_TOKENS = 512
+NUM_EXAMPLES = 20  # Scored questions, excluding the five few-shot examples.
 MTP_SAMPLES = 20
 # Repository layout: <work>/code-mine/sglang/test/manual/ascend/this_file.py.
 SCRIPT_DIR = Path(__file__).resolve().parents[5] / "script"
@@ -174,7 +175,8 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
         self.assertTrue(all(row.get("question") and row.get("answer") for row in rows))
         report_dir = Path(tempfile.mkdtemp(prefix=f"gsm8k_{BACKEND}_", dir=log_dir))
         print(
-            f"GSM8K: backend={BACKEND}, scored=1314, reports={report_dir}", flush=True
+            f"GSM8K: backend={BACKEND}, scored={NUM_EXAMPLES}, reports={report_dir}",
+            flush=True,
         )
         if BACKEND == "pinned":
             resource.setrlimit(resource.RLIMIT_MEMLOCK, (-1, -1))
@@ -197,7 +199,7 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
                     eval_name="gsm8k",
                     api="completion",
                     gsm8k_data_path=data_path,
-                    num_examples=1319,
+                    num_examples=NUM_EXAMPLES,
                     num_shots=5,
                     num_threads=4,
                     max_tokens=MAX_TOKENS,
