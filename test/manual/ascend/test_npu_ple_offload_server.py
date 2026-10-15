@@ -7,7 +7,8 @@ The child cache and all table directories are private to each test.
 
 Covers explicit enable/disable, NPU automatic default, default/explicit pinned,
 file directory creation/default/restart reuse, argument rejection, filesystem
-errors, segmented decode graphs, sequential decode and concurrent requests.
+errors, ordinary UVA and fallback segmented graphs, sequential decode and
+concurrent requests.
 This is not a task-accuracy or performance benchmark. A restart reuses files but
 the production loader still rewrites their weights; it is not a no-load test.
 """
@@ -26,6 +27,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -101,6 +103,7 @@ class ObserverLoader(importlib.abc.Loader):
                 cpu = weight.device.type == "cpu"
                 data = {
                     "pid": os.getpid(),
+                    "tp_rank": module.get_parallel().tp_rank,
                     "layer": instance.ple_layer_index,
                     "embedding_class": type(embedding).__name__,
                     "device": weight.device.type,
@@ -110,6 +113,15 @@ class ObserverLoader(importlib.abc.Loader):
                     "shape": list(weight.shape),
                     "start": embedding.shard_indices.org_vocab_start_index,
                     "end": embedding.shard_indices.org_vocab_end_index,
+                    "npu_uva_enabled": bool(
+                        getattr(embedding, "npu_uva_enabled", False)
+                    ),
+                    "npu_uva_fallback_reason": getattr(
+                        embedding, "npu_uva_fallback_reason", None
+                    ),
+                    "requires_npu_host_offload_graph": bool(
+                        getattr(embedding, "requires_npu_host_offload_graph", False)
+                    ),
                 }
                 os.write(1, ("PLE_TEST_TABLE " + json.dumps(data) + "\n").encode())
                 instance._ple_test_reported = True
@@ -359,7 +371,19 @@ class TestNpuPleOffloadServer(CustomTestCase):
                 )
                 self.assertEqual(record["device"], "cpu")
                 self.assertIs(record["pinned"], backend == "pinned")
+                self.assertIs(
+                    record["requires_npu_host_offload_graph"],
+                    not record["npu_uva_enabled"],
+                )
+                if record["npu_uva_enabled"]:
+                    self.assertEqual(backend, "pinned")
+                    self.assertEqual(record["dtype"], "bfloat16")
+                    self.assertIsNone(record["npu_uva_fallback_reason"])
+                else:
+                    self.assertIsInstance(record["npu_uva_fallback_reason"], str)
+                    self.assertTrue(record["npu_uva_fallback_reason"])
                 if backend == "file":
+                    self.assertFalse(record["npu_uva_enabled"])
                     self.assertIsNotNone(record["mapping"])
                     self.assertEqual(
                         os.path.dirname(os.path.realpath(record["mapping"])),
@@ -369,24 +393,57 @@ class TestNpuPleOffloadServer(CustomTestCase):
             else:
                 self.assertEqual(record["embedding_class"], "VocabParallelEmbedding")
                 self.assertEqual(record["device"], "npu")
+                self.assertFalse(record["npu_uva_enabled"])
+                self.assertIsNone(record["npu_uva_fallback_reason"])
+                self.assertFalse(record["requires_npu_host_offload_graph"])
+        self.assertEqual(
+            {int(record["tp_rank"]) for record in records}, set(range(int(TP_SIZE)))
+        )
+        captures = re.findall(
+            r"TP(\d+)\].*Capture target decode NPU graph end\.", self.log()
+        )
+        self.assertEqual(set(map(int, captures)), set(range(int(TP_SIZE))))
         segments = re.findall(
             r"TP(\d+)\].*NPU PLE decode graph split into (\d+) segments around (\d+) host lookups",
             self.log(),
         )
-        if enabled:
-            self.assertEqual(
-                {int(rank) for rank, _, _ in segments}, set(range(int(TP_SIZE)))
+        expected_segmented_ranks = {
+            int(record["tp_rank"])
+            for record in records
+            if record["requires_npu_host_offload_graph"]
+        }
+        self.assertEqual(
+            {int(rank) for rank, _, _ in segments}, expected_segmented_ranks
+        )
+        self.assertTrue(
+            all(int(count) > 1 and int(lookups) > 0 for _, count, lookups in segments)
+        )
+        routes = re.findall(
+            r"TP(\d+)\].*NPU PLE lookup route: (uva|cpu_staging)(?: \(([^\n]*)\))?",
+            self.log(),
+        )
+        expected_routes = Counter(
+            (
+                int(record["tp_rank"]),
+                "uva" if record["npu_uva_enabled"] else "cpu_staging",
             )
-            self.assertTrue(
-                all(
-                    int(count) > 1 and int(lookups) > 0
-                    for _, count, lookups in segments
+            for record in records
+            if enabled
+        )
+        self.assertEqual(
+            Counter((int(rank), route) for rank, route, _ in routes), expected_routes
+        )
+        for record in records:
+            if enabled and not record["npu_uva_enabled"]:
+                self.assertTrue(
+                    any(
+                        int(rank) == record["tp_rank"]
+                        and route == "cpu_staging"
+                        and record["npu_uva_fallback_reason"] in reason
+                        for rank, route, reason in routes
+                    ),
+                    "CPU fallback log does not contain the observed reason",
                 )
-            )
-        else:
-            self.assertFalse(
-                segments, "Disabled PLE still registered host lookup graph segments"
-            )
 
     def check_serving(self, enabled=True, backend="pinned", directory=None):
         info = self.server_info()
