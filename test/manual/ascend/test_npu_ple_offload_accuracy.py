@@ -1,4 +1,7 @@
-"""PLE GSM8K: 5-shot completion, 20 scored questions; run with python3."""
+"""PLE GSM8K: thinking off, 20 questions per mode; run with python3.
+
+Runs normal PLE inference and paired MTP with PLE disabled/enabled (60 requests).
+"""
 
 import json
 import os
@@ -32,7 +35,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 MODEL = os.path.join(MODEL_WEIGHTS_DIR, "Qwen3.8-Flash-Next")
 BACKEND = "pinned"  # Change to "file" to evaluate that backend.
 MIN_ACCURACY = 0.95  # Reference CI gate, not a Qwen model-card score.
-MAX_TOKENS = 512
+MAX_TOKENS = 1024
 NUM_EXAMPLES = 20  # Scored questions, excluding the five few-shot examples.
 MTP_SAMPLES = 20
 # Repository layout: <work>/code-mine/sglang/test/manual/ascend/this_file.py.
@@ -162,6 +165,13 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
         (report_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary), flush=True)
         self.assertEqual(summary["answer_mismatches"], [], str(report_dir))
+        for mode, correct in summary["correct"].items():
+            self.assertGreaterEqual(
+                correct / len(selected), MIN_ACCURACY, f"MTP {mode}: {report_dir}"
+            )
+
+    def test_mtp_ple_small(self):
+        self.mtp_ple_small()
 
     def test_gsm8k(self):
         self.assertIn(BACKEND, ("pinned", "file"))
@@ -175,7 +185,7 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
         self.assertTrue(all(row.get("question") and row.get("answer") for row in rows))
         report_dir = Path(tempfile.mkdtemp(prefix=f"gsm8k_{BACKEND}_", dir=log_dir))
         print(
-            f"GSM8K: backend={BACKEND}, scored={NUM_EXAMPLES}, reports={report_dir}",
+            f"GSM8K: speculative=off, backend={BACKEND}, scored={NUM_EXAMPLES}, reports={report_dir}",
             flush=True,
         )
         if BACKEND == "pinned":
@@ -197,7 +207,10 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
                     model=MODEL,
                     base_url=DEFAULT_URL_FOR_TEST,
                     eval_name="gsm8k",
-                    api="completion",
+                    # Raw completion can terminate before answering this
+                    # instruction model; use its template with thinking off.
+                    api="chat",
+                    chat_template_kwargs={"enable_thinking": False},
                     gsm8k_data_path=data_path,
                     num_examples=NUM_EXAMPLES,
                     num_shots=5,
@@ -222,4 +235,4 @@ class TestNpuPleOffloadAccuracy(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2, failfast=True)
+    unittest.main(verbosity=2)
