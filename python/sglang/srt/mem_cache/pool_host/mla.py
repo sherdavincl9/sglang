@@ -700,6 +700,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        from torch.distributed import get_rank
+        if get_rank() == 0:
+            print(
+                f"[mla-io] H2D enter backend={io_backend} layout={self.layout} "
+                f"ascendc={ascendc_io_enabled()} layer_id={layer_id} "
+                f"is_draft={is_draft}",
+                flush=True,
+            )
         if not is_draft and layer_id not in self._target_layer_indices:
             return
         host_indices = maybe_dcp_kernel_indices(
@@ -791,6 +799,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ik_start, ik_num = self._indexer_slot_range_for_layer(
                         native, device_layer_id
                     )
+                    from torch.distributed import get_rank
+                    if get_rank() == 0:
+                        print(f"[offload] transfer H2D---")
                     self._transfer_ascendc_sparse_copy(
                         native,
                         host_indices,
@@ -904,6 +915,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
+        from torch.distributed import get_rank
+        if get_rank() == 0:
+            print(
+                f"[mla-io] D2H enter backend={io_backend} layout={self.layout} "
+                f"ascendc={ascendc_io_enabled()}",
+                flush=True,
+            )
         host_indices = maybe_dcp_kernel_indices(
             host_indices, self.dcp_size, self.dcp_rank
         )
@@ -1016,6 +1034,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":
                 if _is_npu and ascendc_io_enabled():
+                    from torch.distributed import get_rank
+                    if get_rank() == 0:
+                        print(f"[offload] transfer D2H---")
                     self._transfer_ascendc_sparse_copy(
                         native,
                         host_indices,
