@@ -103,6 +103,26 @@ def ensure_memfabric_capacity(total_bytes: int, device_id: int) -> None:
         )
 
 
+def _register_mf_host_block(tensor: torch.Tensor) -> None:
+    """Register an MF-allocated block with the acc_offload entry manager.
+
+    offload.empty memory is not visible to get_dva/host_get_device_pointer
+    until host_register maps it, and the AIV kv_exchange kernel dereferences
+    the resulting DVA directly. Registration happens once, at allocation
+    time; the kernel-side host_memory table resolves interior views by byte
+    offset at transfer time.
+    """
+    try:
+        from sgl_kernel_npu.host_memory import register_host_memory
+    except ImportError as exc:
+        raise ImportError(
+            "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires sgl-kernel-npu "
+            "with host_memory.register_host_memory (AIV kv_exchange needs "
+            "host-registered MF blocks)"
+        ) from exc
+    register_host_memory(tensor)
+
+
 def alloc_with_memfabric(
     dims: tuple,
     dtype: torch.dtype,
@@ -117,6 +137,7 @@ def alloc_with_memfabric(
         numel *= d
     tensor = offload.empty(list(dims), dtype=dtype)
     _memfabric_state["allocated_bytes"] += numel * dtype.itemsize
+    _register_mf_host_block(tensor)
     return tensor
 
 
