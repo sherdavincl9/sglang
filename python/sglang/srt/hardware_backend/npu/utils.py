@@ -191,7 +191,9 @@ def set_default_server_args(args: "ServerArgs"):
                 "set_default_server_args",
                 hicache_mem_layout=(
                     "layer_first_kv_split"
-                    if cfg.hicache_mem_layout == "layer_first_kv_split"
+                    if cfg.hicache_mem_layout in (
+                        "layer_first", "layer_first_kv_split"
+                    )
                     else "page_first_kv_split"
                 ),
             )

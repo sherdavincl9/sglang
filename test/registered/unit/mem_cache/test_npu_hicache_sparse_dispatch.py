@@ -37,6 +37,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             "_npu_draft_pool_compatible",
             "_warn_draft_indexer_skipped",
             "init_kv_buffer",
+            "_init_kv_split_buffer",
         }
         methods = ast.Module(
             body=[
@@ -83,6 +84,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             index_layer_indices=(0, 2),
             index_width=128,
             k_width=512,
+            v_width=64,
         )
         h._native_infos = [SimpleNamespace(native_buffers=lambda: self.native)]
         h._native_buffers = self.native
@@ -217,23 +219,99 @@ class TestNPUSparseDispatch(unittest.TestCase):
     def test_pf_and_lf_allocation_mirror_native_component_shapes(self):
         h = self.host
         h.page_num, h.layer_num, h.page_size = 8, 3, 128
-        h.dtype = SimpleNamespace(itemsize=2)
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        h.dsa_kv_cache_store_fp8 = False
-        self.namespace["ALLOC_MEMORY_FUNCS"] = {"npu": lambda shape, **_: Buffer(shape)}
-        self.namespace["torch"] = SimpleNamespace(float32="fp32")
-        for layout, kshape, ishape in (
-            ("page_first_kv_split", (8, 3, 128, 1, 512), (8, 2, 128, 1, 128)),
-            ("layer_first_kv_split", (3, 8, 128, 1, 512), (2, 8, 128, 1, 128)),
+        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        reserve = Mock()
+        empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        self.namespace.update(
+            ALLOC_MEMORY_FUNCS={"npu": allocate},
+            alloc_with_memfabric=allocate,
+            ensure_memfabric_capacity=reserve,
+            memfabric_host_memory_enabled=lambda: True,
+            torch=SimpleNamespace(
+                float32="fp32",
+                empty=empty,
+                npu=SimpleNamespace(current_device=lambda: 0),
+            ),
+        )
+        for layout, kv_dims, index_dims in (
+            ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
+            ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
         ):
-            with self.subTest(layout=layout):
-                h.layout = layout
-                self.assertIs(h.init_kv_buffer(), h.k_buffer)
-                self.assertEqual(h.k_buffer.shape, kshape)
-                self.assertEqual(h.index_k_buffer.shape, ishape)
-                self.assertEqual(h.index_k_scale_buffer.shape, (*ishape[:-1], 1))
+            for packed in (False, True):
+                with self.subTest(layout=layout, packed=packed):
+                    allocate.reset_mock()
+                    reserve.reset_mock()
+                    empty.reset_mock()
+                    h.layout = layout
+                    h.dsa_kv_cache_store_fp8 = packed
+                    h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
+                    self.native.k_width = 656 if packed else 512
+                    v_width = 0 if packed and layout == "layer_first_kv_split" else 64
+                    self.assertIs(h.init_kv_buffer(), h.k_buffer)
+                    self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
+                    self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
+                    self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
+                    expected_bytes = 8 * 128 * (
+                        3 * (self.native.k_width + v_width) * h.dtype.itemsize
+                        + 2 * 128 * h.dtype.itemsize
+                        + 2 * 4
+                    )
+                    reserve.assert_called_once_with(expected_bytes, 0)
+                    self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
+                    self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
+
+    def test_lf_allocation_requires_memfabric_before_allocating(self):
+        h = self.host
+        h.layout, h.page_num = "layer_first_kv_split", 8
+        h._transfer_device = SimpleNamespace(type="npu")
+        h.kv_lora_rank, h.dsa_kv_cache_store_fp8 = 512, False
+        allocate = Mock()
+        self.namespace["ALLOC_MEMORY_FUNCS"] = {"npu": allocate}
+        with self.assertRaisesRegex(ValueError, "SGLANG_HICACHE_HOST_MEM_BACKEND"):
+            h.init_kv_buffer()
+        allocate.assert_not_called()
+
+    def test_npu_layout_resolution_keeps_split_layouts_mla_only(self):
+        path = ROOT / "python/sglang/srt/hardware_backend/npu/utils.py"
+        tree = ast.parse(path.read_text())
+        function = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "set_default_server_args"
+        )
+        block = next(
+            n for n in function.body
+            if isinstance(n, ast.If)
+            and any(
+                isinstance(child, ast.keyword) and child.arg == "hicache_io_backend"
+                for child in ast.walk(n)
+            )
+        )
+        code = compile(ast.Module(body=[block], type_ignores=[]), str(path), "exec")
+        for mla in (False, True):
+            for layout in ("layer_first", "layer_first_kv_split", "page_first"):
+                with self.subTest(mla=mla, layout=layout):
+                    resolved = {}
+                    cfg = SimpleNamespace(
+                        enable_hierarchical_cache=True, hicache_mem_layout=layout
+                    )
+                    namespace = dict(
+                        cfg=cfg,
+                        args=cfg,
+                        use_mla_backend=lambda _: mla,
+                        declare_resolution=lambda args, source, **kw: resolved.update(kw),
+                    )
+                    exec(code, namespace)
+                    expected = (
+                        "layer_first_kv_split"
+                        if layout in ("layer_first", "layer_first_kv_split")
+                        else "page_first_kv_split"
+                    ) if mla else "page_first_direct"
+                    self.assertEqual(resolved["hicache_mem_layout"], expected)
+                    self.assertEqual(resolved["hicache_io_backend"], "kernel_ascend")
 
     def test_controller_keeps_pf_and_lf_indices_on_npu(self):
         path = ROOT / "python/sglang/srt/managers/cache_controller.py"
