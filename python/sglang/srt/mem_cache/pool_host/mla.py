@@ -440,27 +440,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         if memfabric_host_memory_enabled():
             # Memfabric-mapped host DRAM: required by the AIV sparse-copy IO
-            # path and usable by the legacy memcpy2d path unchanged.  Each
-            # buffer allocated below becomes its own offload.empty block
-            # GB-rounded by the host-memory entry, so size the reserve with
-            # the per-buffer bytes (a list) instead of a raw combined sum.
-            total_bytes = [
+            # path and usable by the legacy memcpy2d path unchanged.  Size
+            # the reserve with the combined bytes below.
+            total_bytes = (
                 self.page_num
                 * self.page_size
                 * self.layer_num
-                * k_width
+                * (k_width + v_width)
                 * self.dtype.itemsize
-            ]
-            if v_width > 0:
-                total_bytes.append(
-                    self.page_num
-                    * self.page_size
-                    * self.layer_num
-                    * v_width
-                    * self.dtype.itemsize
-                )
+            )
             if native.index_k is not None:
-                total_bytes.append(
+                total_bytes += (
                     self.page_num
                     * self.page_size
                     * num_indexer_layers
@@ -469,7 +459,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             if native.index_scales is not None:
                 # FP32 scale mirror
-                total_bytes.append(
+                total_bytes += (
                     self.page_num * self.page_size * num_indexer_layers * 4
                 )
             ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
