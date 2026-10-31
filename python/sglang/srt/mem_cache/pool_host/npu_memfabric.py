@@ -76,8 +76,10 @@ def ensure_memfabric_capacity(total_bytes: int, device_id: int) -> None:
         config = offload.OffloadConfig()
         config.device_id = device_id
         config.reserve_size = total_bytes
-        config.alloc_size = total_bytes
-        config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
+        # HOST_MEM (init/malloc/register-split pool) is the only entry that
+        # implements host_register/host_get_device_pointer, required by the
+        # AIV kv_exchange kernel; validated on the mf_aiv branch.
+        config.flags = offload.OFFLOAD_FLAG_HOST_MEM
         config.scene = offload.Scene.LOCAL
         assert offload.initialize(config) == 0, "offload.initialize failed"
         _memfabric_state.update(
