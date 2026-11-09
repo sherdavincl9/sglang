@@ -376,17 +376,11 @@ def alloc_with_pin_memory_npu(
     """
     Allocate an NPU host tensor using the configured host-memory backend.
     """
-    from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-        acl_host_memory_enabled,
-        alloc_with_acl,
-        alloc_with_memfabric,
-        memfabric_host_memory_enabled,
-    )
+    from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
 
-    if memfabric_host_memory_enabled():
-        return alloc_with_memfabric(dims, dtype, device, pin_memory, allocator)
-    if acl_host_memory_enabled():
-        return alloc_with_acl(dims, dtype, device, pin_memory, allocator)
+    backend = get_host_memory_backend()
+    if backend is not None:
+        return backend.alloc(dims, dtype, device, pin_memory, allocator)
     return alloc_with_pin_memory(dims, dtype, device, pin_memory, allocator)
 
 

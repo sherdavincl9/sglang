@@ -33,9 +33,8 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    ensure_memfabric_capacity,
-    memfabric_host_memory_enabled,
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    get_host_memory_backend,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -1011,8 +1010,9 @@ def _reserve_dsv4_paged_host_memory(
         sibling = _dsv4_rope_sibling(kvcache, 128)
         if sibling is not None:
             add_paged(sibling[1], sibling[2], c128_num_host_pages)
-    if paged_blocks and memfabric_host_memory_enabled():
-        ensure_memfabric_capacity(sum(paged_blocks), torch.npu.current_device())
+    backend = get_host_memory_backend()
+    if paged_blocks and backend is not None:
+        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
 
 
 def build_deepseek_v4_hicache_stack(

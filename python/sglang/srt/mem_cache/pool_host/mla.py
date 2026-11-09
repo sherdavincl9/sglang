@@ -34,10 +34,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    ensure_memfabric_capacity,
-    memfabric_host_memory_enabled,
-)
+from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -422,10 +419,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
 
-        if memfabric_host_memory_enabled():
-            # MemFabric host-memory entry: reserve the exact block total.
-            # The aclrt path registers each block at allocation time and
-            # needs no up-front declaration.
+        backend = get_host_memory_backend()
+        if backend is not None:
+            # Declare the combined block budget up front. MemFabric fixes its
+            # entity reservation at the first declaration; the aclrt path
+            # registers each block at allocation time and keeps the no-op.
             total_bytes = (
                 self.page_num
                 * self.page_size
@@ -452,7 +450,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if native.index_scales is not None:
                 # FP32 scale mirror
                 total_bytes += self.page_num * self.page_size * num_indexer_layers * 4
-            ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
+            backend.ensure_capacity(total_bytes, torch.npu.current_device())
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,
