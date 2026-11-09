@@ -34,8 +34,6 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    acl_host_memory_enabled,
-    ensure_acl_capacity,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
 )
@@ -961,8 +959,8 @@ def _reserve_dsv4_paged_host_memory(
     import torch
 
     # Declare every DSV4 paged host block before constructing the SWA pool.
-    # MemFabric fixes its reservation at the first allocation; ACL tracks
-    # registration on each allocation.
+    # Per-block byte sizes; MemFabric fixes its reservation at the first
+    # declaration, so the blocks are summed before declaring.
     paged_blocks = []
     layer_first = get_memory().hicache_mem_layout == "layer_first"
 
@@ -1013,11 +1011,8 @@ def _reserve_dsv4_paged_host_memory(
         sibling = _dsv4_rope_sibling(kvcache, 128)
         if sibling is not None:
             add_paged(sibling[1], sibling[2], c128_num_host_pages)
-    if paged_blocks:
-        if memfabric_host_memory_enabled():
-            ensure_memfabric_capacity(paged_blocks, torch.npu.current_device())
-        elif acl_host_memory_enabled():
-            ensure_acl_capacity(paged_blocks, torch.npu.current_device())
+    if paged_blocks and memfabric_host_memory_enabled():
+        ensure_memfabric_capacity(sum(paged_blocks), torch.npu.current_device())
 
 
 def build_deepseek_v4_hicache_stack(

@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    ensure_acl_capacity,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
 )
@@ -423,41 +422,37 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
 
-        total_bytes = [
-            self.page_num
-            * self.page_size
-            * self.layer_num
-            * k_width
-            * self.dtype.itemsize
-        ]
-        if v_width > 0:
-            total_bytes.append(
+        if memfabric_host_memory_enabled():
+            # MemFabric host-memory entry: reserve the exact block total.
+            # The aclrt path registers each block at allocation time and
+            # needs no up-front declaration.
+            total_bytes = (
                 self.page_num
                 * self.page_size
                 * self.layer_num
-                * v_width
+                * k_width
                 * self.dtype.itemsize
             )
-        if native.index_k is not None:
-            total_bytes.append(
-                self.page_num
-                * self.page_size
-                * num_indexer_layers
-                * native.index_width
-                * self.dtype.itemsize
-            )
-        if native.index_scales is not None:
-            # FP32 scale mirror
-            total_bytes.append(
-                self.page_num * self.page_size * num_indexer_layers * 4
-            )
-        if memfabric_host_memory_enabled():
-            # MemFabric host-memory entry: GB-rounds every block on A3,
-            # so the reserve budget and accounting must round the same way.
+            if v_width > 0:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * self.layer_num
+                    * v_width
+                    * self.dtype.itemsize
+                )
+            if native.index_k is not None:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * num_indexer_layers
+                    * native.index_width
+                    * self.dtype.itemsize
+                )
+            if native.index_scales is not None:
+                # FP32 scale mirror
+                total_bytes += self.page_num * self.page_size * num_indexer_layers * 4
             ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
-        else:
-            # aclrt registration: no fixed reserve, per-block accounting.
-            ensure_acl_capacity(total_bytes, torch.npu.current_device())
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,
