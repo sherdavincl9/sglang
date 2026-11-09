@@ -5,10 +5,10 @@ torch pin_memory buffers are only reachable by the SDMA engine; AIV kernels
 device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
 (a NpuHostMemoryBackend subclass resolved by get_host_memory_backend()):
 
-- ``memfabric`` (MemfabricHostMemoryBackend): the MemFabric offload entity
-  (DRAM_MAP_HOST_VA, see acc_offload_local_dram_entry.cpp) allocates and
-  registers host DRAM (offload.empty + offload.host_register).  The HiCache
-  host pool is allocated through memfabric_hybrid.offload.empty AND the
+- ``memfabric`` (MemfabricHostMemoryBackend): a MemFabric ``Offload``
+  instance owns the host pool; ``pool.initialize`` reserves and
+  pre-registers the whole DRAM range and ``pool.empty`` hands out blocks.
+  The HiCache host pool is allocated through the Offload instance AND the
   L2<->L1 IO uses the AIV kv_exchange kernel.
 - ``acl`` (AclHostMemoryBackend): standard CANN runtime registration
   (aclrtHostRegister with ACL_HOST_REGISTER_MAPPED, see the kernel-side
@@ -84,42 +84,46 @@ class NpuHostMemoryBackend:
 
 
 class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
-    """Host blocks from the MemFabric host-memory entry (offload.empty).
+    """Host blocks from a MemFabric Offload instance (pool.empty).
 
-    The entity is initialized with OFFLOAD_FLAG_HOST_MEM -- the
-    init/malloc/register-split pool, and the only pool implementing
-    host_register/host_get_device_pointer for the AIV kv_exchange kernel.
-    This flag combination is the one device-validated on the mf_aiv branch.
+    One ``memfabric_hybrid.offload.Offload`` instance owns the host pool:
+    ``pool.initialize`` reserves and pre-registers the whole DRAM range, so
+    every ``pool.malloc``/``pool.empty`` block is device-visible immediately
+    (16-byte-bump allocation, no per-block GB rounding), and
+    ``pool.host_register`` on a block is an idempotent in-pool check.  The
+    instance is published to sgl_kernel_npu.host_memory (set_memfabric_pool)
+    so its register/get-device-pointer calls resolve through the same pool.
     """
 
     def __init__(self):
-        self._offload = None
+        self._pool = None
         self._initialized = False
         self._reserved_bytes = 0
         self._allocated_bytes = 0
         self._device_id = None
 
     def _get_offload(self):
-        if self._offload is None:
+        if self._pool is None:
             try:
                 from memfabric_hybrid import offload
             except ImportError as exc:
                 raise ImportError(
                     "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires "
-                    "the memfabric_hybrid package (provides the acc_offload host "
-                    "memory allocator). Install it or unset the env var."
+                    "the memfabric_hybrid package (provides the Offload "
+                    "host-memory pool). Install it or unset the env var."
                 ) from exc
-            self._offload = offload
-        return self._offload
+            self._pool = offload.Offload()
+            self._offload_module = offload
+        return self._offload_module
 
     def _register_block(self, tensor: torch.Tensor) -> None:
-        """Register an MF-allocated block with the acc_offload entry manager.
+        """Enter an MF-allocated block into the kernel DVA table.
 
-        offload.empty memory is not visible to get_dva/host_get_device_pointer
-        until host_register maps it, and the AIV kv_exchange kernel
-        dereferences the resulting DVA directly. Registration happens once,
-        at allocation time; the kernel-side host_memory table resolves
-        interior views by byte offset at transfer time.
+        The pool itself is already device-mapped at initialize time; this
+        registration makes the block (and its interior views) resolvable by
+        the AIV kv_exchange kernel through the host_memory table. Registration
+        happens once, at allocation time; interior views resolve by byte
+        offset at transfer time.
         """
         try:
             from sgl_kernel_npu.host_memory import register_host_memory
@@ -127,12 +131,12 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             raise ImportError(
                 "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires sgl-kernel-npu "
                 "with host_memory.register_host_memory (AIV kv_exchange needs "
-                "host-registered MF blocks)"
+                "registered MF blocks)"
             ) from exc
         register_host_memory(tensor)
 
     def ensure_capacity(self, total_bytes: int, device_id: int) -> None:
-        """Initialize the host-memory entry, sized by total_bytes.
+        """Initialize the host pool, sized by total_bytes.
 
         total_bytes is the combined byte size of all buffers the calling
         host pool is about to allocate (ultimately derived from
@@ -145,26 +149,35 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             config = offload.OffloadConfig()
             config.device_id = device_id
             config.reserve_size = total_bytes
+            # LOCAL scene requires alloc_size == reserve_size.
+            config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
-            config.flags = offload.OFFLOAD_FLAG_HOST_MEM
-            ret = offload.initialize(config)
+            config.flags = 0
+            ret = self._pool.initialize(config)
             if ret != 0:
+                self._pool = None
                 raise RuntimeError(
-                    f"offload.initialize(OFFLOAD_FLAG_HOST_MEM) failed: ret={ret}, "
+                    f"Offload.initialize failed: ret={ret}, "
                     f"device_id={device_id}, reserve_size={total_bytes}"
                 )
+            try:
+                from sgl_kernel_npu.host_memory import set_memfabric_pool
+
+                set_memfabric_pool(self._pool)
+            except ImportError:
+                pass
             self._initialized = True
             self._reserved_bytes = total_bytes
             self._device_id = device_id
             logger.info(
-                "[HiCache] memfabric host memory initialized (host-mem entry): "
+                "[HiCache] memfabric host pool initialized (Offload entry): "
                 "reserve=%.2fGB device=%d (exact combined budget)",
                 total_bytes / _MEMFABRIC_GB,
                 device_id,
             )
         elif self._device_id != device_id:
             raise RuntimeError(
-                f"memfabric host memory is already initialized for device "
+                f"memfabric host pool is already initialized for device "
                 f"{self._device_id}, got device {device_id}"
             )
         remaining = self._reserved_bytes - self._allocated_bytes
@@ -187,11 +200,11 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         pin_memory: bool,
         allocator: None,
     ) -> torch.Tensor:
-        """Allocate one host-memory-entry block and register its DVA.
+        """Allocate one host-pool block and enter it into the DVA table.
 
         The Python-side accounting tracks the exact block byte size.
         """
-        offload = self._get_offload()
+        self._get_offload()
         numel = 1
         for d in dims:
             numel *= d
@@ -204,7 +217,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
                 f"only {remaining / _MEMFABRIC_GB:.2f}GB left of the "
                 f"{self._reserved_bytes / _MEMFABRIC_GB:.2f}GB reserve"
             )
-        tensor = offload.empty(list(dims), dtype=dtype)
+        tensor = self._pool.empty(list(dims), dtype=dtype)
         self._register_block(tensor)
         self._allocated_bytes += nbytes
         return tensor
