@@ -330,14 +330,13 @@ class RunnerIds:
             parallel = get_parallel()
             if _is_npu and parallel.dcp_enabled and not is_draft_worker:
                 # An NPU DCP target writes its rank's share of the window in
-                # rank-local slots (-1: another rank's); the scheduler,
-                # `req_to_token` and the replicated draft pool keep the
-                # allocator-global ones the window is planned in.
+                # rank-local slots, interleaved by token (-1: another rank's).
+                # The scheduler, `req_to_token` and the replicated draft pool
+                # keep the allocator-global slots.
                 localize = functools.partial(
                     localize_dcp_indices,
                     dcp_size=parallel.dcp_size,
                     dcp_rank=parallel.dcp_rank,
-                    interleave_size=page_size,
                 )
                 self._call_spaces = self._spaces
                 self._spaces = {

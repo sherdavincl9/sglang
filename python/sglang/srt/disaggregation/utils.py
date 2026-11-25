@@ -1853,6 +1853,7 @@ def setup_state_kv_args(
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
     empty_draft_kv_ring: bool = False,
+    register_npu_dcp_layout: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1860,7 +1861,7 @@ def setup_state_kv_args(
     A DFLASH draft KV ring's rows and floor go after the storage's entries:
     readers that zip against the storage's wire entries skip them, and the wire
     check and the checksum filter find them there."""
-    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.disaggregation.base.conn import NpuDcpLayout, StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -1936,11 +1937,37 @@ def setup_state_kv_args(
     if isinstance(owner_view, NPUMLATokenToKVPool):
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
-        kv_args.draft_kv_layers = (
-            _token_kv_view(draft_token_to_kv_pool).layer_num
+        draft_view = (
+            _token_kv_view(draft_token_to_kv_pool)
             if draft_token_to_kv_pool is not None
-            else 0
+            else None
         )
+        kv_args.draft_kv_layers = draft_view.layer_num if draft_view is not None else 0
+        if register_npu_dcp_layout:
+            num_draft = kv_args.num_draft_entries
+            layer_ids = kv_args.kv_layer_ids
+            if not layer_ids:
+                layer_ids = owner_view.get_kv_layer_ids()
+                if num_draft:
+                    draft_ids = _draft_entry_layer_ids(
+                        pool=draft_token_to_kv_pool, num_entries=num_draft
+                    )
+                    layer_ids += remap_draft_layer_ids(draft_ids, total_kv_layers)
+            draft_tiles = (
+                draft_view.get_dcp_transfer_tile_bytes()
+                if num_draft and isinstance(draft_view, NPUMLATokenToKVPool)
+                else [0] * num_draft
+            )
+            kv_args.npu_dcp_layout = NpuDcpLayout(
+                kv_args.page_size,
+                layer_ids,
+                owner_view.get_dcp_remote_decode_layout() + [True] * num_draft,
+                owner_view.get_dcp_transfer_tile_bytes() + draft_tiles,
+            )
+            # Equal-size DCP copies whole pages between matching ranks, but must
+            # pair buffers when Prefill PP publishes only part of the Decode pool.
+            if owner_view.dcp_size > 1:
+                kv_args.kv_layer_ids = layer_ids
 
 
 def setup_page_row_kv_args(

@@ -369,6 +369,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             max_context_len=512, req_to_token=torch.zeros(2, 512)
         ),
         token_to_kv_pool=object(),
+        runner_ids=object(),
         use_mla_backend=not is_draft,
         spec_algorithm=spec,
         is_hybrid_swa=False,

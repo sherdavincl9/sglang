@@ -1064,7 +1064,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             indices,
             self.dcp_size,
             self.dcp_rank,
-            self.page_size,
         )
         return local_indices[local_indices >= 0]
 
@@ -1278,12 +1277,34 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for _, uses_global_slots in self._get_disagg_buffer_entries()
         ]
 
-    def get_kv_layer_ids(self):
+    def _uses_fia_nz_kv_layout(self) -> bool:
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_combined_kv_buffer else 2)
-            + self.get_state_layer_ids()
+            self.use_fia_nz
+            and not self.use_combined_kv_buffer
+            and not self.dsa_kv_cache_store_fp8
         )
+
+    def get_dcp_transfer_tile_bytes(self) -> List[int]:
+        """Per-entry tile width for FIA NZ; zero means contiguous token rows."""
+        entries = self._get_disagg_buffer_entries()
+        if not self._uses_fia_nz_kv_layout():
+            return [0] * len(entries)
+        num_kv_entries = len(self.k_buffer) + len(self.v_buffer)
+        tile_bytes = [
+            (32 // buffer.element_size()) * buffer.element_size()
+            if buffer.numel()
+            else 0
+            for buffer, _ in entries[:num_kv_entries]
+        ]
+        return tile_bytes + [0] * (len(entries) - num_kv_entries)
+
+    def get_kv_layer_ids(self):
+        layer_ids = list(self.model_layer_ids)
+        if self.use_combined_kv_buffer:
+            return layer_ids
+        if not self.dsa_kv_cache_store_fp8:
+            layer_ids *= 2
+        return layer_ids + self.get_state_layer_ids()
 
     def get_state_layer_ids(self):
         return list(self.indexer_layer_ids) * (
@@ -1512,6 +1533,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return buffers
 
+    def _kv_cache_copy_view(self, buffer, rows):
+        # A partial FIA NZ page has each logical token split across its
+        # feature tiles; taking whole ND rows would copy unrelated tokens.
+        head_dim = buffer.shape[-1]
+        if not self._uses_fia_nz_kv_layout() or head_dim == 0:
+            return buffer, rows
+        tile_size = 32 // buffer.element_size()
+        tile_rows = _mla_fia_nz_scatter_indices(
+            rows, head_dim, self.physical_page_size, tile_size
+        ).view(-1, head_dim // tile_size)
+        return buffer.view(-1, tile_size), tile_rows
+
     def _get_kv_cache_cpu_copy(self, indices):
         chunk_size = self.cpu_offloading_chunk_size
         kv_cache_cpu = []
@@ -1523,8 +1556,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 rows = self._copy_indices_for_buffer(
                     chunk_indices, self.is_draft_worker
                 )
+                views = [self._kv_cache_copy_view(buf, rows) for buf in buffers]
                 layer_chunks.append(
-                    [buffer[rows].to("cpu", non_blocking=True) for buffer in buffers]
+                    [buf[idx].to("cpu", non_blocking=True) for buf, idx in views]
                 )
             kv_cache_cpu.append(layer_chunks)
         return kv_cache_cpu
@@ -1536,12 +1570,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in range(0, len(indices), chunk_size):  # a chunk of kv rows
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cpu[local_layer_id][i // chunk_size]
+                rows = self._copy_indices_for_buffer(
+                    chunk_indices, self.is_draft_worker
+                )
                 for buffer, cpu in zip(buffers, chunk, strict=True):
-                    rows = self._copy_indices_for_buffer(
-                        chunk_indices, self.is_draft_worker
-                    )
-                    assert cpu.shape[0] == len(rows)
-                    buffer[rows] = cpu.to(buffer.device, non_blocking=True)
+                    view, copy_rows = self._kv_cache_copy_view(buffer, rows)
+                    assert cpu.shape[0] == len(copy_rows)
+                    view[copy_rows] = cpu.to(buffer.device, non_blocking=True)
 
     # Index cache: [layer_num, num_index_pages, index_page_size, 1, index_head_dim]
     def _get_index_cache_layer_buffers(self, local_layer_id):

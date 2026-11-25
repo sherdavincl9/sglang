@@ -34,6 +34,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -501,6 +502,32 @@ class TestWriteIds(CustomTestCase):
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
             self.assertTrue(torch.equal(virt, keep))
             self.assertIs(fb.out_cache_loc_virtual, virt)
+
+    def test_npu_dcp_target_writes_token_rows_and_draft_keeps_global_rows(self):
+        from sglang.srt.mem_cache.kv.alloc import runner_ids
+
+        virtual = torch.tensor([510, 511, 512, 513, 514, 517, 518, -1])
+        owned = torch.tensor([127, -1, -1, -1, 128, -1, 129, -1])
+        parallel = SimpleNamespace(dcp_enabled=True, dcp_size=4, dcp_rank=2)
+        with (
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(runner_ids, "get_parallel", return_value=parallel),
+        ):
+            for is_draft, expected in ((False, owned), (True, virtual)):
+                source = RunnerIds(
+                    req_to_token=virtual[None, :],
+                    token_to_kv_pool_allocator=None,
+                    token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+                    page_size=128,
+                    device=_DEV,
+                    is_draft_worker=is_draft,
+                )
+                batch = _FakeForwardBatch(out_cache_loc=virtual)
+                source.bind_own_plan(batch)
+                torch.testing.assert_close(batch.out_cache_loc, expected)
+                torch.testing.assert_close(
+                    source.ids_in(IdSpaceKind.FULL, virtual), virtual
+                )
 
     def test_capture_capacity_covers_dcp_widened_mamba_ids(self):
         """A capturer must store the highest virtual IDs issued under DCP."""

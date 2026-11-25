@@ -554,7 +554,6 @@ def forward_dsa_prepare_npu(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=forward_context.get_attn_backend().page_size,
             )
     else:
         topk_indices = prev_topk_indices
@@ -600,15 +599,18 @@ def prepare_dcp_extend_metadata_npu(
         kv_cache_dtype.itemsize,
     ):
         return None
+    prefix_lens_dcp_aligned = all(
+        int(length) % parallel.dcp_size == 0 for length in extend_prefix_lens_cpu
+    )
     metadata = prepare_decode_context_parallel_metadata(
         kv_cache_dtype=kv_cache_dtype,
         seq_lens_sum=seq_lens_sum,
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         **planner_kwargs,
-        # NPU pools shard in page_size runs, and the gather reuses its own
-        # buffers rather than a context-sized dcp_kv_buffer per forward.
-        interleave_size=forward_context.get_attn_backend().page_size,
+        # The gather reuses its own buffers instead of allocating a
+        # context-sized dcp_kv_buffer per forward.
         allocate_kv_buffer=False,
+        prefix_lens_dcp_aligned=prefix_lens_dcp_aligned,
     )
     if metadata is None:
         return None

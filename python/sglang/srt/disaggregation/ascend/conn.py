@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
+    NpuDcpTransferEntry,
     _DcpIndexK,
 )
 from sglang.srt.disaggregation.transport.base import Copy
@@ -412,7 +413,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         *,
-        dcp_token_item_lens: List[int],
+        dcp_token_item_lens: Optional[List[int]],
         dst_dcp_size: int,
         dst_dcp_rank: int,
         src_page_offset: int,
@@ -426,8 +427,12 @@ class AscendKVManager(MooncakeKVManager):
         dst_attn_tp_size: Optional[int] = None,
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[_DcpIndexK] = None,
+        npu_dcp_transfer_entries: Optional[List[NpuDcpTransferEntry]] = None,
     ) -> int:
-        if not self._uses_page_interleaved_dcp():
+        if (
+            npu_dcp_transfer_entries is not None
+            or not self._uses_page_interleaved_dcp()
+        ):
             return super().send_kvcache_dcp(
                 mooncake_session_id,
                 prefill_kv_indices,
@@ -447,8 +452,10 @@ class AscendKVManager(MooncakeKVManager):
                 dst_attn_tp_size=dst_attn_tp_size,
                 draft_rows_collapsed=draft_rows_collapsed,
                 dsa_index_k=dsa_index_k,
+                npu_dcp_transfer_entries=npu_dcp_transfer_entries,
             )
 
+        assert dcp_token_item_lens is not None
         src_kv_ptrs = self.kv_args.kv_data_ptrs
         if self.is_hybrid_mla_backend:
             dst_entries = resolve_dcp_dst_entry_indices(

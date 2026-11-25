@@ -48,6 +48,8 @@ def prepare_decode_context_parallel_metadata(
     create_chunked_prefix_cache_kv_indices_fn,
     interleave_size: int = 1,
     allocate_kv_buffer: bool = True,
+    *,
+    prefix_lens_dcp_aligned: bool = True,
 ) -> Optional[DecodeContextParallelMetadata]:
     parallel = get_parallel()
     if not parallel.dcp_enabled:
@@ -118,23 +120,29 @@ def prepare_decode_context_parallel_metadata(
     )
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     runner_ids = get_attn_backend().runner_ids
-    if interleave_size == 1:
-        # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-        dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
-            dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
-        )
-    else:
+    if interleave_size != 1:
         # Interleaved pools are written rank-local, never through translated ids.
         assert runner_ids is None or not runner_ids.is_translating, (
             f"interleave_size={interleave_size} expects a rank-local pool, "
             "but the KV ids are being translated"
         )
+    if interleave_size == 1 and prefix_lens_dcp_aligned:
+        # Every request begins on a DCP cycle boundary in the flattened prefix.
+        owned_kv_indices = dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+    else:
+        prefix_lens_cpu = torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64)
         owned_kv_indices = filter_dcp_local_chunk_kv_indices(
             dcp_prefix_kv_indices,
-            torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),
-            torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64),
+            torch.zeros_like(prefix_lens_cpu),
+            prefix_lens_cpu,
             interleave_size=interleave_size,
         )
+
+    if interleave_size == 1:
+        dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
+            owned_kv_indices
+        )
+    else:
         dcp_local_prefix_kv_indices = dcp_local_row(
             owned_kv_indices, parallel.dcp_size, interleave_size
         )

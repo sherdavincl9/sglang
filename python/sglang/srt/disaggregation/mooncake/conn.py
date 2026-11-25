@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 import msgspec
 import numpy as np
@@ -16,7 +16,7 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, NpuDcpLayout, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
     bind_thread_to_device,
@@ -181,6 +182,34 @@ class TransferInfo:
         )
 
 
+_NPU_TOKEN_DCP_TAG = b"NPU_TOKEN_DCP"
+_NPU_TOKEN_DCP_FRAME = 24
+
+
+# Source entry, destination entry, bytes per storage row, global slots, rows per token.
+NpuDcpTransferEntry = tuple[int, int, int, bool, int]
+
+
+def has_npu_dcp_layout(msg: list[bytes]) -> bool:
+    return (
+        len(msg) > _NPU_TOKEN_DCP_FRAME
+        and msg[_NPU_TOKEN_DCP_FRAME] == _NPU_TOKEN_DCP_TAG
+    )
+
+
+def unpack_npu_dcp_layout(
+    msg: list[bytes], dst_layer_ids: list[int]
+) -> NpuDcpLayout | None:
+    if not has_npu_dcp_layout(msg):
+        return None
+    (page_size,), global_slots, tile_bytes = unpack_int_lists(
+        msg[_NPU_TOKEN_DCP_FRAME + 1], "I"
+    )
+    return NpuDcpLayout(
+        page_size, dst_layer_ids, [bool(slot) for slot in global_slots], tile_bytes
+    )
+
+
 # decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
@@ -216,6 +245,7 @@ class KVArgsRegisterInfo:
     # Decode with a radix cache reuses draft KV beyond the sliding window;
     # a decode that does not say otherwise gets every draft page.
     dst_needs_full_draft_kv: bool = True
+    npu_dcp_transfer_entries: Optional[List[NpuDcpTransferEntry]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -345,6 +375,61 @@ def _dcp_draft_slice_copies(
         ranges[:, 2] = s.copy_bytes
         copies.append(Copy(src=src_keys[s.entry], dst=dst_keys[s.entry], ranges=ranges))
     return copies
+
+
+def iter_npu_token_dcp_copies(
+    plan: DCPTokenTransferPlan,
+    entries: Sequence[NpuDcpTransferEntry],
+    *,
+    src_keys: Sequence[MooncakeBufferKey],
+    dst_keys: Sequence[MooncakeBufferKey],
+    page_size: int,
+    max_transfer_batch_indices: int,
+) -> Iterator[list[Copy]]:
+    batch_size = max_transfer_batch_indices
+    if batch_size <= 0:
+        batch_size = 4096
+    # Target rows belong to one rank. Replicated index-K and draft use the
+    # token planner's unsharded draft rows and keep allocator-global slots.
+    for global_slots, src_rows, dst_rows in (
+        (False, plan.target_src_token_indices, plan.target_dst_token_indices),
+        (True, plan.draft_src_token_indices, plan.draft_dst_token_indices),
+    ):
+        buffer_entries = [entry for entry in entries if entry[3] == global_slots]
+        if not buffer_entries:
+            continue
+        for start in range(0, src_rows.size, batch_size):
+            src_batch = src_rows[start : start + batch_size]
+            dst_batch = dst_rows[start : start + batch_size]
+            units_by_tile_count = {}
+            copies = []
+            for src, dst, width, _, tile_count in buffer_entries:
+                units = units_by_tile_count.get(tile_count)
+                if units is None:
+                    units = _copy_units(src_batch, dst_batch, page_size, tile_count)
+                    units_by_tile_count[tile_count] = units
+                copies.append(
+                    Copy(src=src_keys[src], dst=dst_keys[dst], ranges=units * width)
+                )
+            yield copies
+
+
+def _copy_units(src_rows, dst_rows, page_size, tile_count):
+    # FIA NZ stores [page, tile, token_in_page, tile_width]. An ND page
+    # has one tile, so its units are simply the original token rows.
+    if tile_count > 1:
+        tile_offsets = np.arange(tile_count, dtype=np.int64)[:, None] * page_size
+        src_rows = (
+            src_rows // page_size * page_size * tile_count
+            + src_rows % page_size
+            + tile_offsets
+        ).reshape(-1)
+        dst_rows = (
+            dst_rows // page_size * page_size * tile_count
+            + dst_rows % page_size
+            + tile_offsets
+        ).reshape(-1)
+    return group_units(*group_concurrent_contiguous(src_rows, dst_rows))
 
 
 def _uses_flat_entry_layout(
@@ -1093,6 +1178,91 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, decode_kv_args
             )
         return mismatch
+
+    def _prepare_npu_dcp_entries(
+        self, info: KVArgsRegisterInfo, dst_layout: NpuDcpLayout | None
+    ) -> list[NpuDcpTransferEntry]:
+        kv_args = self.kv_args
+        src_layout = getattr(kv_args, "npu_dcp_layout", None)
+        if src_layout is None or dst_layout is None:
+            raise RuntimeError("PD DCP requires matching NPU token KV layouts")
+        page_size = src_layout.page_size
+        if page_size <= 0 or page_size != dst_layout.page_size:
+            raise RuntimeError("NPU PD DCP requires matching physical page sizes")
+        if not 0 <= info.dst_dcp_rank < info.dst_dcp_size:
+            raise RuntimeError(f"Invalid NPU PD DCP rank {info.dst_dcp_rank}")
+        src_lens, dst_lens = kv_args.kv_item_lens, info.dst_kv_item_lens
+        for layout, ptrs, lengths in (
+            (src_layout, kv_args.kv_data_ptrs, src_lens),
+            (dst_layout, info.dst_kv_ptrs, dst_lens),
+        ):
+            if not (
+                len(ptrs)
+                == len(lengths)
+                == len(layout.layer_ids)
+                == len(layout.global_slots)
+                == len(layout.tile_bytes)
+            ):
+                raise RuntimeError("NPU PD DCP buffer metadata is inconsistent")
+
+        entries = []
+        for src, dst in build_transfer_entry_pairs(
+            src_layout.layer_ids, dst_layout.layer_ids, len(src_lens), len(dst_lens)
+        ):
+            global_slots = src_layout.global_slots[src]
+            tile_bytes = src_layout.tile_bytes[src]
+            if (
+                global_slots != dst_layout.global_slots[dst]
+                or tile_bytes != dst_layout.tile_bytes[dst]
+            ):
+                raise RuntimeError(f"NPU PD DCP buffer layout differs at entry {src}")
+            src_page_tokens = page_size * (self.dcp_size if global_slots else 1)
+            dst_page_tokens = page_size * (info.dst_dcp_size if global_slots else 1)
+            token_bytes, remainder = divmod(src_lens[src], src_page_tokens)
+            expected_stride = token_bytes * dst_page_tokens
+            if remainder or dst_lens[dst] != expected_stride:
+                raise RuntimeError(
+                    f"NPU PD DCP page stride differs at entry {src}: "
+                    f"src={src_lens[src]}, expected dst={expected_stride}, "
+                    f"decode={dst_lens[dst]}"
+                )
+            if tile_bytes and token_bytes % tile_bytes:
+                raise RuntimeError(f"NPU PD DCP NZ tile width differs at entry {src}")
+            if token_bytes:
+                unit_bytes = tile_bytes or token_bytes
+                entries.append(
+                    (src, dst, unit_bytes, global_slots, token_bytes // unit_bytes)
+                )
+        return entries
+
+    def _prepare_decode_registration(
+        self, session_id: str, msg: List[bytes]
+    ) -> Optional[KVArgsRegisterInfo]:
+        native_npu = getattr(
+            self.kv_args, "npu_dcp_layout", None
+        ) is not None or has_npu_dcp_layout(msg)
+        try:
+            info = KVArgsRegisterInfo.from_zmq(msg)
+            dst_layout = (
+                unpack_npu_dcp_layout(msg, info.dst_kv_layer_ids)
+                if native_npu
+                else None
+            )
+        except (IndexError, ValueError, struct.error) as exc:
+            if not native_npu:
+                raise
+            logger.error("Invalid KVArgs from %s: %s", session_id, exc)
+            return None
+
+        info.requires_dcp_relayout = self.requires_dcp_relayout(
+            info.dst_dcp_size, info.dst_dcp_rank
+        )
+        if native_npu:
+            if info.dst_dcp_size > 1:
+                entries = self._prepare_npu_dcp_entries(info, dst_layout)
+                if info.requires_dcp_relayout:
+                    info.npu_dcp_transfer_entries = entries
+        return info
 
     def _reject_decode_without_fan_in(
         self, mooncake_session_id: str, required_dst_info_num: int
@@ -1859,7 +2029,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         *,
-        dcp_token_item_lens: List[int],
+        dcp_token_item_lens: Optional[List[int]],
         dst_dcp_size: int,
         dst_dcp_rank: int,
         src_page_offset: int,
@@ -1873,6 +2043,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[_DcpIndexK] = None,
+        npu_dcp_transfer_entries: Optional[List[NpuDcpTransferEntry]] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -1880,6 +2051,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         if dst_kv_item_lens and len(dst_kv_item_lens) != len(dst_kv_ptrs):
             raise ValueError("PD DCP destination KV lengths must match its buffers")
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+            draft_rows_collapsed=(
+                npu_dcp_transfer_entries is None and draft_rows_collapsed
+            ),
+        )
+        if npu_dcp_transfer_entries is not None:
+            for copies in iter_npu_token_dcp_copies(
+                plan,
+                npu_dcp_transfer_entries,
+                src_keys=self._local_keys.kv,
+                dst_keys=self._peers[mooncake_session_id].keys.kv,
+                page_size=physical_page_size,
+                max_transfer_batch_indices=self.max_transfer_batch_indices,
+            ):
+                ret = self._transfer_copies(mooncake_session_id, copies)
+                if ret != 0:
+                    return ret
+            return 0
+
+        assert dcp_token_item_lens is not None
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             dst_indices = resolve_dcp_dst_entry_indices(
@@ -1908,17 +2107,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_draft = self.kv_args.num_draft_entries
         num_target = len(src_kv_ptrs) - num_draft
 
-        plan = build_dcp_token_transfer_plan(
-            prefill_kv_indices,
-            dst_kv_indices,
-            physical_page_size=physical_page_size,
-            dcp_size=dst_dcp_size,
-            dcp_rank=dst_dcp_rank,
-            src_page_offset=src_page_offset,
-            decode_prefix_len=decode_prefix_len,
-            num_kv_tokens=num_kv_tokens,
-            draft_rows_collapsed=draft_rows_collapsed,
-        )
         if plan.empty():
             return 0
 
@@ -3540,7 +3728,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
                             )
-                            assert dcp_token_item_lens is not None
+                            npu_entries = getattr(
+                                target_rank_registration_info,
+                                "npu_dcp_transfer_entries",
+                                None,
+                            )
+                            assert (
+                                npu_entries is not None
+                                or dcp_token_item_lens is not None
+                            )
                             pack_buffer = (
                                 self._dcp_pack_buffers[worker_index]
                                 if self._dcp_pack_buffers
@@ -3566,9 +3762,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 draft_rows_collapsed=target_rank_registration_info.dst_draft_rows_dcp_collapsed,
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                                dsa_index_k=self.dsa_index_k_dcp_entries(
-                                    target_rank_registration_info
+                                dsa_index_k=(
+                                    self.dsa_index_k_dcp_entries(
+                                        target_rank_registration_info
+                                    )
+                                    if npu_entries is None
+                                    else None
                                 ),
+                                npu_dcp_transfer_entries=npu_entries,
                             )
                         elif (
                             self.is_mla_backend
@@ -3917,12 +4118,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
+                    decode_kv_args = self._prepare_decode_registration(
+                        mooncake_session_id, waiting_req_bytes
                     )
-                    if decode_kv_args.requires_dcp_relayout:
+                    if decode_kv_args is None:
+                        continue
+                    if (
+                        decode_kv_args.requires_dcp_relayout
+                        and decode_kv_args.npu_dcp_transfer_entries is None
+                    ):
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
                         dst_item_lens: List[Optional[int]] = [
@@ -4197,7 +4401,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        return [
+        message = [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -4233,6 +4437,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             str(self.kv_args.num_draft_entries).encode("ascii"),
             b"1" if self.decode_enable_radix_cache else b"0",
         ]
+        layout = getattr(self.kv_args, "npu_dcp_layout", None)
+        if self.dcp_size > 1 and layout is not None:
+            message.append(_NPU_TOKEN_DCP_TAG)
+            message.append(
+                pack_int_lists(
+                    [[layout.page_size], layout.global_slots, layout.tile_bytes], "I"
+                )
+            )
+        return message
 
     def build_receiver_metadata_message(
         self,

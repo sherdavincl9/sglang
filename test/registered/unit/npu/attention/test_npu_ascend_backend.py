@@ -563,6 +563,30 @@ class TestGenerateAlibiBias(unittest.TestCase):
 
 
 class TestMlaPrefixCacheDcp(unittest.TestCase):
+    def test_dcp_lengths_use_token_ownership_with_physical_page_tables(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.page_size = 4
+        backend.speculative_num_draft_tokens = 3
+        page_bases = torch.tensor([[16, 48], [64, 32]])
+        backend.req_to_token = (page_bases[..., None] + torch.arange(16)).reshape(2, 32)
+        lengths = torch.tensor([19, 24])
+        request_rows = torch.tensor([0, 1])
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=4, attn_dcp_rank=2),
+        ):
+            local_lens, block_tables = backend._get_kv_lens_and_block_tables(
+                lengths, request_rows
+            )
+            verify_lens, verify_tables = backend._get_kv_lens_and_block_tables(
+                lengths, request_rows, is_spec=True
+            )
+
+        self.assertEqual(local_lens.tolist(), [5, 6])
+        self.assertEqual(block_tables.tolist(), [[1, 3], [4, 2]])
+        self.assertEqual(verify_lens.tolist(), [4, 4, 5, 5, 6, 6])
+        self.assertEqual(verify_tables.tolist(), [[1, 3]] * 3 + [[4, 2]] * 3)
+
     def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
         from sglang.srt.hardware_backend.npu.attention.mla_cache import (
             build_mla_prefix_token_indices,
@@ -615,7 +639,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                         global_lens = (
                             local_lens
                             if size == 1
-                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                            else ([9, 5] if local_lens == [5, 3] else [8, 8])
                         )
                         backend.forward_metadata = ForwardMetadata(
                             prefix_lens=torch.tensor(global_lens),
@@ -682,9 +706,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                                 gather.call_args.args[2],
                                 backend.forward_metadata.prefix_lens,
                             )
-                            self.assertEqual(
-                                gather.call_args.kwargs, {"interleave_size": page}
-                            )
+                            self.assertEqual(gather.call_args.kwargs, {})
                             torch.testing.assert_close(
                                 torch.cat((result_k, result_pe), -1),
                                 full_prefix,
@@ -747,7 +769,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             values = values + request * 10000
             full.append(values)
             positions = torch.arange(length)
-            local.append(values[(positions // page_size) % size == rank])
+            local.append(values[positions % size == rank])
         expected_local = torch.cat(local)
         expected_full = torch.cat(full)
         needs_compaction = any(len(values) % page_size for values in local)
@@ -788,11 +810,11 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             get_value_buffer=lambda _: rope,
         )
 
-        def gather(kv, pe, global_lens, *, interleave_size):
+        def gather(kv, pe, global_lens, *, interleave_size=1):
             torch.testing.assert_close(kv, expected_local[..., :32], atol=0, rtol=0)
             torch.testing.assert_close(pe, expected_local[..., 32:], atol=0, rtol=0)
             self.assertEqual(global_lens.tolist(), lengths)
-            self.assertEqual(interleave_size, page_size)
+            self.assertEqual(interleave_size, 1)
             return expected_full
 
         with (

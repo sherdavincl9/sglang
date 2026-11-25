@@ -87,6 +87,47 @@ class _FakeGroup:
             output.copy_(input_tensor)
 
 
+class TestNpuDcpExtendPrefixMetadata(unittest.TestCase):
+    def test_prefix_ownership_restarts_for_each_request(self):
+        from sglang.srt.layers.dcp import planner
+
+        prefix = torch.tensor([3, 7], dtype=torch.int32)
+        req_to_token = torch.arange(16, 24) + torch.tensor([[0], [32]])
+        translate = MagicMock(side_effect=lambda slots: slots // 4)
+        backend = SimpleNamespace(
+            runner_ids=SimpleNamespace(translate_dcp_read_ids=translate)
+        )
+
+        def gather(table, _rows, _starts, _lens, _offsets, out, _stride):
+            out.copy_(torch.cat((table[0, :3], table[1, :7])))
+
+        with (
+            rc.get_parallel().override(dcp_enabled=True, dcp_size=4, dcp_rank=2),
+            patch.object(
+                planner, "get_device", return_value=SimpleNamespace(device="cpu")
+            ),
+            patch.object(planner, "get_attn_backend", return_value=backend),
+            patch.object(planner, "create_dcp_kv_indices", {(2,): lambda *args: None}),
+        ):
+            metadata = planner.prepare_decode_context_parallel_metadata(
+                seq_lens=prefix + 1,
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.tolist(),
+                extend_seq_lens=torch.ones_like(prefix),
+                req_pool_indices=torch.arange(2),
+                req_to_token=req_to_token,
+                seq_lens_sum=12,
+                kv_buffer_shape=(1, 1),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn={(2,): gather},
+                allocate_kv_buffer=False,
+                prefix_lens_dcp_aligned=False,
+            )
+        self.assertEqual(metadata.dcp_local_prefix_kv_indices.tolist(), [4, 12, 13])
+        translate.assert_called_once()
+
+
 class TestNpuDcpLengths(unittest.TestCase):
     PAGE_SIZE = 4
 
@@ -436,12 +477,12 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
-        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
-        indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=128)
+        indices = torch.tensor([510, 511, 512, 513, 514, 517, 518, -1])
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=False
         )
-        self.assertEqual(got.tolist(), [0, 1, 2, 3])
+        self.assertEqual(got.tolist(), [127, 128, 129])
 
     def test_retraction_indices_keep_indexer_slots_global(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
@@ -461,6 +502,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
 
     def test_pd_buffer_infos_expand_only_global_page_strides(self):
         pool = object.__new__(NPUMLATokenToKVPool)
+        pool.use_fia_nz = True
         pool.use_combined_kv_buffer = False
         pool.k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.v_buffer = [torch.empty(4, 8, 1, 1)]
@@ -472,6 +514,8 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.index_page_size = 8
         pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
+        pool.model_layer_ids = (7,)
+        pool.indexer_layer_ids = (7,)
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
         buffers = (
@@ -492,6 +536,49 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
                 pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
             ],
         )
+        self.assertEqual(pool.get_kv_layer_ids(), [7, 7, 7, 7])
+        self.assertEqual(pool.get_dcp_transfer_tile_bytes(), [32, 32, 0, 0])
+        pool.dsa_kv_cache_store_fp8 = True
+        self.assertEqual(pool.get_kv_layer_ids(), [7, 7, 7])
+        self.assertEqual(pool.get_dcp_transfer_tile_bytes(), [0, 0, 0])
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.use_combined_kv_buffer = True
+        pool.kv_buffer = [torch.empty(4, 8, 1, 3)]
+        self.assertEqual(pool.get_kv_layer_ids(), [7])
+        self.assertEqual(pool.get_dcp_transfer_tile_bytes(), [0])
+
+    def test_retraction_round_trip_copies_all_nz_tiles_in_owned_token_rows(self):
+        pool = object.__new__(NPUMLATokenToKVPool)
+        pool.page_size = 4
+        pool.index_kpool = 1
+        pool.layer_num = 1
+        pool.start_layer = 0
+        pool.dcp_size = 4
+        pool.dcp_rank = 1
+        pool.is_draft_worker = False
+        pool.use_fia_nz = True
+        pool.use_combined_kv_buffer = False
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.cpu_offloading_chunk_size = 3
+        pool.k_buffer = torch.arange(384, dtype=torch.float32).view(1, 3, 4, 1, 32)
+        pool.v_buffer = torch.arange(192, dtype=torch.float32).view(1, 3, 4, 1, 16)
+
+        def token_major(buffer):
+            # Three pages, eight float32 values per 32-byte NZ tile.
+            return (
+                buffer.view(3, -1, 4, 8).transpose(1, 2).reshape(12, buffer.shape[-1])
+            )
+
+        src = torch.arange(16, 23)
+        dst = torch.arange(32, 39)
+        buffers = [pool.k_buffer, pool.v_buffer]
+        expected = [token_major(buf).clone() for buf in buffers]
+        for rows in expected:
+            rows[8:10] = rows[4:6]
+        saved = pool._get_kv_cache_cpu_copy(src)
+        pool._load_kv_cache_cpu_copy(saved, dst)
+        for buffer, rows in zip(buffers, expected, strict=True):
+            torch.testing.assert_close(token_major(buffer), rows)
 
     def test_lse_merge_world_size_one_is_identity(self):
         group = _FakeGroup(world_size=1)

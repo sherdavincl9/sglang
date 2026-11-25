@@ -428,6 +428,7 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.runner_ids = model_runner.runner_ids
         self.dcp_fp8_sparse_attention = None
         if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
             if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
@@ -595,7 +596,7 @@ class AscendAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build rank-local paged KV metadata for NPU DSA DCP."""
+        """Build a physical page table and rank-local token lengths for MLA DCP."""
         parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
@@ -603,15 +604,15 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             ).int()
+        # The allocator still maps one P*D logical page to a P-row page on each
+        # rank. Its aligned first slot identifies that local page on every rank.
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
         block_tables = (
@@ -844,7 +845,6 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
                 )
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
@@ -905,7 +905,7 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
                     forward_batch,
-                    interleave_size=self.page_size,
+                    interleave_size=1,
                     device=self.device,
                 )
 
@@ -1475,7 +1475,6 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
                 )
                 active_mask_width = max(1, num_pages) * self.page_size
                 dcp_mask = build_mla_dcp_mtp_mask(
@@ -2360,7 +2359,6 @@ class AscendAttnBackend(AttentionBackend):
                 kv_cached,
                 k_rope_cached,
                 self.forward_metadata.prefix_lens,
-                interleave_size=self.page_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return kv_cached, k_rope_cached

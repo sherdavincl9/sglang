@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -59,12 +59,23 @@ class KVTransferDestination(str, enum.Enum):
     HOST = "host"
 
 
+class NpuDcpLayout(NamedTuple):
+    """Registration order and physical layout for native MLA buffers."""
+
+    page_size: int
+    layer_ids: list[int]
+    global_slots: list[bool]
+    # Zero for contiguous token rows, otherwise bytes per row tile in FIA NZ.
+    tile_bytes: list[int]
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
+    npu_dcp_layout: Optional[NpuDcpLayout] = None
     kv_cache_dtype_str: str
     # KV byte layout both PD roles must share; None for pools with only one.
     kv_layout: Optional[str] = None

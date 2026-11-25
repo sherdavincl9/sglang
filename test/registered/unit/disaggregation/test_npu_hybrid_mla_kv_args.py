@@ -6,10 +6,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.utils import setup_state_kv_args
+from sglang.srt.disaggregation.base.conn import KVArgs, NpuDcpLayout, StateType
+from sglang.srt.disaggregation.utils import build_kv_layer_ids, setup_state_kv_args
 from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,17 +38,18 @@ def _recurrent_state(layer_ids):
     )
 
 
-def _npu_mla(layer_num):
+def _npu_mla(layer_num, *, is_draft_worker=False):
     return NPUMLATokenToKVPool(
         **_MLA,
         kv_lora_rank=16,
-        qk_rope_head_dim=8,
+        qk_rope_head_dim=16,
         layer_num=layer_num,
         enable_memory_saver=False,
+        is_draft_worker=is_draft_worker,
     )
 
 
-def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
+def _hybrid_npu_mla(full_layer_ids, state_layer_ids, **kwargs):
     return HybridLinearKVPool(
         **_MLA,
         head_num=1,
@@ -56,12 +58,13 @@ def _hybrid_npu_mla(full_layer_ids, state_layer_ids):
         mamba_pool=_recurrent_state(state_layer_ids),
         use_mla=True,
         kv_lora_rank=16,
-        qk_rope_head_dim=8,
+        qk_rope_head_dim=16,
         full_kv_pool_class=NPUMLATokenToKVPool,
+        **kwargs,
     )
 
 
-def _register(target, draft):
+def _register(target, draft, *, register_npu_dcp_layout=False):
     allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: target)
     storage = StaticKVStorage(
         None,
@@ -70,21 +73,34 @@ def _register(target, draft):
         num_hidden_layers=_TARGET_LAYERS,
     )
     kv_args = KVArgs()
+    if register_npu_dcp_layout:
+        kv_args.page_size = target.page_size
+        kv_args.num_draft_entries = len(draft.get_contiguous_buf_infos()[0])
+        with patch.object(memory_pool, "_is_npu", True):
+            kv_args.kv_layer_ids = build_kv_layer_ids(
+                token_to_kv_pool=target,
+                draft_token_to_kv_pool=draft,
+                num_draft_entries=kv_args.num_draft_entries,
+                num_hidden_layers=_TARGET_LAYERS,
+                storage=storage,
+            )
     setup_state_kv_args(
         kv_args,
         storage,
         draft_token_to_kv_pool=draft,
         total_kv_layers=_TARGET_LAYERS,
+        register_npu_dcp_layout=register_npu_dcp_layout,
     )
     return kv_args
 
 
 class TestNpuHybridMlaKvArgs(CustomTestCase):
     def setUp(self):
+        self.parallel = SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0)
         parallel = patch.object(
             memory_pool_npu,
             "get_parallel",
-            return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+            return_value=self.parallel,
         )
         parallel.start()
         self.addCleanup(parallel.stop)
@@ -136,6 +152,26 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         kv_args = _register(self.target, None)
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.draft_kv_layers, 0)
+
+    def test_npu_token_dcp_registers_hybrid_dsa_and_draft_layout(self):
+        self.parallel.attn_dcp_size = 4
+        target = _hybrid_npu_mla(
+            (0, 2, 4), (1, 3, 5), use_dsa=True, index_head_dim=8, kv_cache_dim=16
+        )
+        draft = _npu_mla(layer_num=1, is_draft_worker=True)
+        target.full_kv_pool.use_fia_nz = draft.use_fia_nz = True
+        kv_args = _register(target, draft, register_npu_dcp_layout=True)
+
+        self.assertEqual(
+            kv_args.npu_dcp_layout,
+            NpuDcpLayout(
+                page_size=4,
+                layer_ids=[0, 2, 4] * 3 + [6, 6],
+                global_slots=[False] * 6 + [True] * 5,
+                tile_bytes=[32] * 6 + [0] * 3 + [32] * 2,
+            ),
+        )
+        self.assertEqual(kv_args.kv_layer_ids, kv_args.npu_dcp_layout.layer_ids)
 
 
 if __name__ == "__main__":
