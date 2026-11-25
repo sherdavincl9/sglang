@@ -66,7 +66,15 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
         memfabric = Mock(return_value="memfabric")
         acl = Mock(return_value="acl")
         get_backend = Mock(return_value=None)
-        backend = SimpleNamespace(get_host_memory_backend=get_backend)
+        reserve = Mock()
+        memfabric_cls = type("MemfabricHostMemoryBackend", (), {})
+        memfabric_backend = memfabric_cls()
+        memfabric_backend.alloc = memfabric
+        backend = SimpleNamespace(
+            MemfabricHostMemoryBackend=memfabric_cls,
+            get_host_memory_backend=get_backend,
+            reserve_memfabric_hicache=reserve,
+        )
         namespace = {
             "torch": SimpleNamespace(Tensor=object, dtype=object, empty=native)
         }
@@ -89,15 +97,18 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
             native.assert_called_once_with(
                 (2, 3), dtype="uint8", device="cpu", pin_memory=True
             )
+            reserve.assert_not_called()
 
-            get_backend.return_value = SimpleNamespace(alloc=memfabric)
+            get_backend.return_value = memfabric_backend
             self.assertEqual(allocate(**kwargs), "memfabric")
+            reserve.assert_called_once_with(memfabric_backend, (2, 3), "uint8")
             memfabric.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
             self.assertEqual(native_allocate(**kwargs), "native")
 
             get_backend.return_value = SimpleNamespace(alloc=acl)
             self.assertEqual(allocate(**kwargs), "acl")
             acl.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
+            self.assertEqual(reserve.call_count, 1)
 
 
 class TestNPUSparseDispatch(unittest.TestCase):
@@ -126,15 +137,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        backend_tree = ast.parse(path.with_name("npu_host_memory.py").read_text())
-        methods.body.append(
-            next(
-                n
-                for n in backend_tree.body
-                if isinstance(n, ast.FunctionDef)
-                and n.name == "reserve_mla_split_host_memory"
-            )
-        )
         self.ops = {
             name: Mock(name=name)
             for name in (
@@ -153,7 +155,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
             torch=SimpleNamespace(
                 distributed=SimpleNamespace(is_initialized=lambda: False)
             ),
-            get_host_memory_backend=lambda: None,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})
@@ -408,16 +409,10 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
         allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
-        reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
             ALLOC_MEMORY_FUNCS={"npu": allocate},
-            get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
-            torch=SimpleNamespace(
-                float32="fp32",
-                empty=empty,
-                npu=SimpleNamespace(current_device=lambda: 0),
-            ),
+            torch=SimpleNamespace(float32="fp32", empty=empty),
         )
         for layout, kv_dims, index_dims in (
             ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
@@ -426,7 +421,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
             for packed in (False, True):
                 with self.subTest(layout=layout, packed=packed):
                     allocate.reset_mock()
-                    reserve.reset_mock()
                     empty.reset_mock()
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
@@ -438,65 +432,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
-                    expected_blocks = [
-                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
-                    ]
-                    if v_width:
-                        expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
-                    reserve.assert_called_once_with(sum(expected_blocks), 0)
-                    self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
-                    self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
-
-    def test_acl_allocation_mirrors_component_budget(self):
-        """The ACL backend receives the same component budget as MemFabric."""
-        h = self.host
-        h.page_num, h.layer_num, h.page_size = 8, 3, 128
-        h._transfer_device = SimpleNamespace(type="npu")
-        h.device, h.pin_memory, h.allocator = "cpu", True, None
-        h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
-        reserve = Mock()
-        empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
-        self.namespace.update(
-            ALLOC_MEMORY_FUNCS={"npu": allocate},
-            get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
-            torch=SimpleNamespace(
-                float32="fp32",
-                empty=empty,
-                npu=SimpleNamespace(current_device=lambda: 0),
-            ),
-        )
-        for layout, kv_dims, index_dims in (
-            ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
-            ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
-        ):
-            for packed in (False, True):
-                with self.subTest(layout=layout, packed=packed):
-                    allocate.reset_mock()
-                    reserve.reset_mock()
-                    empty.reset_mock()
-                    h.layout = layout
-                    h.dsa_kv_cache_store_fp8 = packed
-                    h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
-                    self.native.k_width = 656 if packed else 512
-                    v_width = 0 if packed else 64
-                    self.assertIs(h.init_kv_buffer(), h.k_buffer)
-                    self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
-                    self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
-                    self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
-                    self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
-                    expected_blocks = [
-                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
-                    ]
-                    if v_width:
-                        expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
-                    reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 

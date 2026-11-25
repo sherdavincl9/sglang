@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     prepare_page_unified_write_back_staging,
 )
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.pool_host.npu_host_memory import memfabric_host_memory_budget
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -517,16 +518,16 @@ def build_kv_cache(
         tp_rank=parallel.tp_rank,
         tp_group=parallel.tp_group,
     )
-    with auto_size_hicache(
-        params,
-        hicache_draft_plan,
-        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+    build_host_pool = enable_hierarchical_cache or retraction_backup == "host_pool"
+    with (
+        auto_size_hicache(params, hicache_draft_plan, enabled=build_host_pool),
+        memfabric_host_memory_budget(
+            token_to_kv_pool, enabled=build_host_pool, sync_snapshot=True
+        ),
     ):
         tree_cache = create_tree_cache(tree_context)
 
-        if (
-            enable_hierarchical_cache or retraction_backup == "host_pool"
-        ) and hicache_draft_plan is not None:
+        if build_host_pool and hicache_draft_plan is not None:
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,

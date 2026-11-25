@@ -26,24 +26,21 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import is_npu
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLASplitBuffers
 
 logger = logging.getLogger(__name__)
 
 _MEMFABRIC_GB = 1024**3
+_MEMFABRIC_RESERVE_SLACK = 0.05
 
 
 def host_memory_backend() -> str | None:
@@ -190,7 +187,6 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
             config.executor = offload.Executor.AICPU
-            config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
             ret = self._pool.initialize(config)
             if ret != 0:
                 self._pool = None
@@ -302,6 +298,9 @@ class AclHostMemoryBackend(NpuHostMemoryBackend):
 
 
 _backend: NpuHostMemoryBackend | None = None
+_memfabric_hicache_budget: ContextVar[tuple[object, int] | None] = ContextVar(
+    "memfabric_hicache_budget", default=None
+)
 
 
 def get_host_memory_backend() -> NpuHostMemoryBackend | None:
@@ -321,109 +320,92 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     return _backend
 
 
-def reserve_mla_split_host_memory(
-    *,
-    num_pages: int,
-    page_size: int,
-    num_layers: int,
-    k_width: int,
-    v_width: int,
-    dtype: torch.dtype,
-    v_dtype: torch.dtype,
-    buffers: MLASplitBuffers,
-) -> None:
-    """Reserve the split MLA host buffers before allocating them."""
-    backend = get_host_memory_backend()
-    if backend is None:
+@contextmanager
+def memfabric_host_memory_budget(
+    kv_pool: object, *, enabled: bool = True, sync_snapshot: bool = False
+):
+    """Save the host budget before the first pool books memory."""
+    if (
+        not enabled
+        or not is_npu()
+        or not memfabric_host_memory_enabled()
+        or _memfabric_hicache_budget.get() is not None
+    ):
+        yield
         return
 
-    num_tokens = num_pages * page_size
-    num_kv_rows = num_tokens * num_layers
-    total_bytes = num_kv_rows * k_width * dtype.itemsize
-    if v_width > 0:
-        total_bytes += num_kv_rows * v_width * v_dtype.itemsize
-
-    # GLM-5.3-Flash index_kpool > 1 packs Indexer pages compressed
-    # (index_page_size < page_size).
-    num_index_tokens = (
-        num_pages * buffers.index_k.shape[2]
-        if buffers.index_k is not None
-        else num_tokens
+    from sglang.srt.mem_cache.pool_host.base import (
+        host_memory_budget_scope,
+        host_memory_preflight,
     )
-    num_indexer_rows = num_index_tokens * len(buffers.index_layer_indices)
-    if buffers.index_k is not None:
-        total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
-    if buffers.index_scales is not None:
-        total_bytes += num_indexer_rows * 4  # Host scales are FP32.
 
-    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+    host_bytes = host_memory_preflight(book=False).available_bytes
+    # The auto-size path already synchronizes ranks after sampling host memory.
+    if (
+        sync_snapshot
+        and get_memory().hicache_host_memory_fraction is None
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+    token = _memfabric_hicache_budget.set((kv_pool, host_bytes))
+    try:
+        # Later pools continue booking from this snapshot after MF claims DRAM.
+        with host_memory_budget_scope(host_bytes):
+            yield
+    finally:
+        _memfabric_hicache_budget.reset(token)
 
 
-def reserve_dsv4_paged_host_memory(
-    *,
-    infos: Mapping[PoolName, DevicePoolInfo],
-    num_host_pages: int,
-    swa_num_host_pages: int,
-    c128_num_host_pages: int,
-    num_draft_swa_layers: int,
+def build_memfabric_kv_host_pool(kv_pool, build, /, *args, **kwargs):
+    """Prepare the same budget for a standalone decode host pool."""
+    with memfabric_host_memory_budget(kv_pool):
+        return build(*args, **kwargs)
+
+
+def reserve_memfabric_hicache(
+    backend: MemfabricHostMemoryBackend, dims: tuple, dtype: torch.dtype
 ) -> None:
-    """Reserve DSV4 paged buffers before constructing the host pools."""
-    if not is_npu():
+    """Initialize MemFabric on its first nonempty host allocation."""
+    if backend._initialized:
         return
-
-    # Declare every DSV4 paged host block before constructing the SWA pool.
-    # Per-block byte sizes; MemFabric fixes its reservation at the first
-    # declaration, so the blocks are summed before declaring.
-    paged_blocks = []
-    layer_first = get_memory().hicache_mem_layout == "layer_first"
-
-    def add_blocks(layer_bytes):
-        if not layer_bytes:
-            return
-        # Match actual allocator calls: one block per layer for layer_first,
-        # one block for the entire pool for page-first layouts.
-        if layer_first:
-            paged_blocks.extend(layer_bytes)
-        else:
-            paged_blocks.append(sum(layer_bytes))
-
-    def add_paged(name: PoolName, pages: int, draft_layers: int = 0) -> None:
-        info = infos.get(name)
-        if info is not None:
-            region = info.buffer_info
-            add_blocks(
-                [pages * region.page_bytes] * (len(region.buffers) + draft_layers)
+    budget = _memfabric_hicache_budget.get()
+    if budget is None:
+        raise RuntimeError(
+            "MemFabric HiCache allocation requires a host memory budget."
+        )
+    kv_pool, host_bytes = budget
+    memory = get_memory()
+    fixed_size = memory.hicache_size > 0
+    if fixed_size:
+        nominal_bytes = memory.hicache_size * 1_000_000_000
+    else:
+        device_budget_bytes = getattr(kv_pool, "memfabric_device_budget_bytes", None)
+        if device_budget_bytes is None:
+            raise ValueError(
+                "MemFabric HiCache ratio requires the pre-split device memory budget."
             )
-
-    add_paged(PoolName.SWA, swa_num_host_pages, num_draft_swa_layers)
-    c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
-    if c4 is not None and c4.layer_ids:
-        for name in (
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-            PoolName.DEEPSEEK_V4_C4_ROPE,
-        ):
-            add_paged(name, num_host_pages)
-        for name in (
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-        ):
-            checkpoint = infos.get(name)
-            if checkpoint is not None:
-                add_blocks(
-                    [
-                        swa_num_host_pages * state.pages.shape[1]
-                        for state in checkpoint.buffer_info.states
-                    ]
-                )
-    c128 = infos.get(PoolName.DEEPSEEK_V4_C128)
-    if c128 is not None and c128.layer_ids:
-        add_paged(PoolName.DEEPSEEK_V4_C128, c128_num_host_pages)
-        add_paged(PoolName.DEEPSEEK_V4_C128_ROPE, c128_num_host_pages)
-    backend = get_host_memory_backend()
-    if paged_blocks and backend is not None:
-        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
+        nominal_bytes = math.ceil(memory.hicache_ratio * device_budget_bytes)
+    # Leave room for host pool padding. LOCAL commits whole GiB of DRAM,
+    # so pass the aligned capacity to the allocator's byte accounting.
+    available = host_bytes // _MEMFABRIC_GB * _MEMFABRIC_GB
+    first_block_bytes = math.prod(dims) * dtype.itemsize
+    minimum_bytes = (
+        max(first_block_bytes, nominal_bytes) if fixed_size else first_block_bytes
+    )
+    if available < minimum_bytes:
+        raise ValueError(
+            f"Not enough host memory for MemFabric HiCache: need "
+            f"{minimum_bytes / _MEMFABRIC_GB:.2f} GiB, but only "
+            f"{available / _MEMFABRIC_GB:.2f} GiB is available after alignment."
+        )
+    target_bytes = max(
+        first_block_bytes, math.ceil(nominal_bytes * (1 + _MEMFABRIC_RESERVE_SLACK))
+    )
+    target = -(-target_bytes // _MEMFABRIC_GB) * _MEMFABRIC_GB
+    # The ratio estimate can include capacity later removed by device pool caps.
+    total_bytes = min(target, available)
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
 # ---------------------------------------------------------------------------

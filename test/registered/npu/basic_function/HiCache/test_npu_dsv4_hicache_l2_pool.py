@@ -101,9 +101,6 @@ class TestDSV4PoolAssembly(CustomTestCase):
         with (
             patch.object(assembler, "get_memory", return_value=memory),
             patch.object(
-                assembler, "reserve_dsv4_paged_host_memory"
-            ) as reserve_host_memory,
-            patch.object(
                 assembler, "_deepseek_v4_num_host_pages", return_value=(2, 0, 0)
             ),
             patch.object(assembler, "_get_allocator_type", return_value="default"),
@@ -122,7 +119,6 @@ class TestDSV4PoolAssembly(CustomTestCase):
                 storage_backend=None,
             )
 
-        reserve_host_memory.assert_called_once()
         k_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER].host_pool
         scale_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE].host_pool
         self.assertIs(k_host.device_buffers[0], k_buffer[0])

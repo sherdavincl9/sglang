@@ -429,6 +429,7 @@ class KVCacheConfigurator:
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
+    _memfabric_device_budget_bytes: int | None = field(init=False, default=None)
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
     dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
@@ -618,6 +619,9 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        if self._memfabric_device_budget_bytes is not None:
+            kvcache = pools.token_to_kv_pool_allocator.get_kvcache()
+            kvcache.memfabric_device_budget_bytes = self._memfabric_device_budget_bytes
         state = pools.state
         if state is not None:
             # State reads go through the KV pool's router, which owns the
@@ -3327,6 +3331,14 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        if _is_npu and not self.is_draft_worker:
+            from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+                memfabric_host_memory_enabled,
+            )
+
+            if memfabric_host_memory_enabled() and get_memory().hicache_size <= 0:
+                # MemFabric uses the whole device pool budget before the split.
+                self._memfabric_device_budget_bytes = int(rest_memory * (1 << 30))
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
         rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)

@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
-from sglang.srt.mem_cache.pool_host import npu_host_memory
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -435,108 +434,6 @@ class TestDSV4HostViews(CustomTestCase):
                         load.call_args.kwargs["host_indices"], torch.tensor([2, 3])
                     )
                 )
-
-    @staticmethod
-    def _paged_pool_info(num_layers, page_bytes):
-        return SimpleNamespace(
-            layer_ids=tuple(range(num_layers)),
-            buffer_info=SimpleNamespace(
-                buffers=(object(),) * num_layers, page_bytes=page_bytes
-            ),
-        )
-
-    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
-        infos = {PoolName.SWA: self._paged_pool_info(2, 6)}
-        backend = MagicMock()
-        with (
-            patch.object(npu_host_memory, "is_npu", return_value=True),
-            patch.object(
-                npu_host_memory,
-                "get_memory",
-                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
-            ),
-            patch.object(
-                npu_host_memory, "get_host_memory_backend", return_value=backend
-            ),
-            patch.object(
-                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
-            ),
-        ):
-            npu_host_memory.reserve_dsv4_paged_host_memory(
-                infos=infos,
-                num_host_pages=4,
-                swa_num_host_pages=4,
-                c128_num_host_pages=0,
-                num_draft_swa_layers=0,
-            )
-        backend.ensure_capacity.assert_called_once_with(48, 0)
-
-    def test_capacity_declares_actual_paged_and_state_allocations(self):
-        def checkpoint_info(num_layers, ring_bytes):
-            state = SimpleNamespace(pages=SimpleNamespace(shape=(1, ring_bytes)))
-            return SimpleNamespace(
-                buffer_info=SimpleNamespace(states=(state,) * num_layers)
-            )
-
-        infos = {
-            PoolName.SWA: self._paged_pool_info(2, 6),
-            PoolName.DEEPSEEK_V4_C4: self._paged_pool_info(2, 4),
-            PoolName.DEEPSEEK_V4_C4_INDEXER: self._paged_pool_info(1, 3),
-            PoolName.DEEPSEEK_V4_C4_ROPE: self._paged_pool_info(2, 2),
-            PoolName.DEEPSEEK_V4_C4_STATE: checkpoint_info(2, 8),
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE: checkpoint_info(2, 16),
-            PoolName.DEEPSEEK_V4_C128: self._paged_pool_info(1, 5),
-            PoolName.DEEPSEEK_V4_C128_ROPE: self._paged_pool_info(1, 7),
-        }
-        expected_blocks = {
-            "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
-            "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
-        }
-        for backend_name in ("acl", "memfabric"):
-            for layout, blocks in expected_blocks.items():
-                backend = MagicMock(name=backend_name)
-                with (
-                    self.subTest(backend=backend_name, layout=layout),
-                    patch.object(npu_host_memory, "is_npu", return_value=True),
-                    patch.object(
-                        npu_host_memory,
-                        "get_memory",
-                        return_value=SimpleNamespace(hicache_mem_layout=layout),
-                    ),
-                    patch.object(
-                        npu_host_memory, "get_host_memory_backend", return_value=backend
-                    ),
-                    patch.object(
-                        torch,
-                        "npu",
-                        SimpleNamespace(current_device=lambda: 0),
-                        create=True,
-                    ),
-                ):
-                    npu_host_memory.reserve_dsv4_paged_host_memory(
-                        infos=infos,
-                        num_host_pages=4,
-                        swa_num_host_pages=4,
-                        c128_num_host_pages=2,
-                        num_draft_swa_layers=1,
-                    )
-                backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
-
-    def test_non_npu_skips_host_memory_reservation(self):
-        with (
-            patch.object(npu_host_memory, "is_npu", return_value=False),
-            patch.object(npu_host_memory, "get_memory") as get_memory,
-            patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
-        ):
-            npu_host_memory.reserve_dsv4_paged_host_memory(
-                infos={},
-                num_host_pages=0,
-                swa_num_host_pages=0,
-                c128_num_host_pages=0,
-                num_draft_swa_layers=0,
-            )
-        get_memory.assert_not_called()
-        get_backend.assert_not_called()
 
 
 class TestC128L2Ownership(CustomTestCase):
