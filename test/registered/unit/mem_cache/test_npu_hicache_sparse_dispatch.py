@@ -115,6 +115,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             "_init_npu_transfer_bindings",
             "_npu_draft_pool_compatible",
             "_warn_draft_indexer_skipped",
+            "get_mapping_lengths",
             "init_kv_buffer",
             "_init_kv_split_buffer",
         }
@@ -407,6 +408,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
     def test_pf_and_lf_allocation_mirror_native_component_shapes(self):
         h = self.host
         h.page_num, h.layer_num, h.page_size = 8, 3, 128
+        h.page_stride_bytes = h.page_bytes = 1
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
@@ -424,9 +426,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 npu=SimpleNamespace(current_device=lambda: 0),
             ),
         )
+        self.native.index_k.shape = (2, 8, 32, 1, 128)
+        self.native.index_scales.shape = (2, 8, 32, 1)
         for layout, kv_dims, index_dims in (
-            ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
-            ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
+            ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 32, 1)),
+            ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 32, 1)),
         ):
             for packed in (False, True):
                 with self.subTest(layout=layout, packed=packed):
@@ -435,7 +439,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     empty.reset_mock()
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
-                    h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
+                    h.dtype = h._v_dtype = SimpleNamespace(itemsize=1 if packed else 2)
                     self.native.k_width = 656 if packed else 512
                     v_width = 0 if packed else 64
                     self.assertIs(h.init_kv_buffer(), h.k_buffer)
@@ -445,11 +449,12 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
                     expected_blocks = [
-                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
+                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize,
+                        8 * 128 * 3 * v_width * h._v_dtype.itemsize,
+                        8 * 32 * 2 * 128 * 2,
+                        8 * 32 * 2 * 4,
                     ]
-                    if v_width:
-                        expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
+                    self.assertEqual(h.get_mapping_lengths(), expected_blocks)
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)

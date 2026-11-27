@@ -369,7 +369,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_mapping_lengths(self) -> list[int]:
         if self.page_stride_bytes != self.page_bytes:
             return [self.page_num * self.page_stride_bytes]
-        if self.layout != "page_first_kv_split" or self._native_buffers is None:
+        if self._native_buffers is None or self.layout not in (
+            "page_first_kv_split",
+            "layer_first_kv_split",
+        ):
             return super().get_mapping_lengths()
         native = self._native_buffers
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
@@ -382,7 +385,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.page_num
             * self.page_size
             * self.layer_num
-            * self.qk_rope_head_dim
+            * (0 if self.dsa_kv_cache_store_fp8 else self.qk_rope_head_dim)
             * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
@@ -453,7 +456,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             indexer_dims = (
                 len(native.index_layer_indices),
                 self.page_num,
-                self.page_size,
+                native.index_k.shape[2]
+                if native.index_k is not None
+                else self.page_size,
                 1,
             )
             return self._init_kv_split_buffer(
