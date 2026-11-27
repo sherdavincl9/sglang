@@ -27,15 +27,11 @@ import logging
 import math
 import os
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -314,46 +310,6 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
         elif acl_host_memory_enabled():
             _backend = AclHostMemoryBackend()
     return _backend
-
-
-def reserve_mla_split_host_memory(
-    *,
-    num_pages: int,
-    page_size: int,
-    num_layers: int,
-    k_width: int,
-    v_width: int,
-    dtype: torch.dtype,
-    v_dtype: torch.dtype,
-    buffers: MLASplitBuffers,
-) -> None:
-    """Reserve the split MLA host buffers before allocating them."""
-    backend = get_host_memory_backend()
-    if backend is None:
-        return
-
-    num_tokens = num_pages * page_size
-    num_kv_rows = num_tokens * num_layers
-    total_bytes = num_kv_rows * k_width * dtype.itemsize
-    if v_width > 0:
-        total_bytes += num_kv_rows * v_width * v_dtype.itemsize
-
-    # GLM-5.3-Flash index_kpool > 1 packs Indexer pages compressed
-    # (index_page_size < page_size).
-    num_index_tokens = (
-        num_pages * buffers.index_k.shape[2]
-        if buffers.index_k is not None
-        else num_tokens
-    )
-    num_indexer_rows = num_index_tokens * len(buffers.index_layer_indices)
-    if buffers.index_k is not None:
-        total_bytes += (
-            num_indexer_rows * buffers.index_width * buffers.index_k.dtype.itemsize
-        )
-    if buffers.index_scales is not None:
-        total_bytes += num_indexer_rows * buffers.index_scales.dtype.itemsize
-
-    backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
 def ensure_memfabric_host_capacity(total_bytes: int) -> None:

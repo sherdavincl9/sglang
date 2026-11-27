@@ -133,7 +133,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 n
                 for n in backend_tree.body
                 if isinstance(n, ast.FunctionDef)
-                and n.name == "reserve_mla_split_host_memory"
+                and n.name == "ensure_memfabric_host_capacity"
             )
         )
         self.ops = {
@@ -155,6 +155,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 distributed=SimpleNamespace(is_initialized=lambda: False)
             ),
             get_host_memory_backend=lambda: None,
+            memfabric_host_memory_enabled=lambda: True,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})
@@ -459,8 +460,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
-    def test_acl_allocation_mirrors_component_budget(self):
-        """The ACL backend receives the same component budget as MemFabric."""
+    def test_acl_allocation_skips_memfabric_reservation(self):
         h = self.host
         h.page_num, h.layer_num, h.page_size = 8, 3, 128
         h._transfer_device = SimpleNamespace(type="npu")
@@ -472,6 +472,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
+            memfabric_host_memory_enabled=lambda: False,
             ALLOC_MEMORY_FUNCS={"npu": allocate},
             get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
@@ -500,13 +501,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
                     self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
-                    expected_blocks = [
-                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
-                    ]
-                    if v_width:
-                        expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
-                    reserve.assert_called_once_with(sum(expected_blocks), 0)
+                    reserve.assert_not_called()
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 

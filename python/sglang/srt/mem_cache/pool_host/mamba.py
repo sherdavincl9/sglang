@@ -20,6 +20,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    ensure_memfabric_host_capacity,
+    memfabric_host_memory_enabled,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -204,8 +208,9 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
+        mapping_lengths = self.get_mapping_lengths()
         allocation_bytes, available_bytes = host_memory_preflight(
-            self.get_mapping_lengths(),
+            mapping_lengths,
             self.allocator,
             self._buffer_device,
         )
@@ -243,6 +248,8 @@ class MambaPoolHost(HostKVCache):
             for layers in self.conv_device_layers
         ]
 
+        if self._buffer_device.type == "npu" and memfabric_host_memory_enabled():
+            ensure_memfabric_host_capacity(sum(mapping_lengths))
         self.kv_buffer = self.init_kv_buffer()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()

@@ -42,7 +42,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_host_memory import reserve_mla_split_host_memory
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    ensure_memfabric_host_capacity,
+    memfabric_host_memory_enabled,
+)
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -543,16 +546,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if v_width and native.v.dtype != native.k.dtype:
             v_dtype = native.v.dtype
 
-        reserve_mla_split_host_memory(
-            num_pages=self.page_num,
-            page_size=self.page_size,
-            num_layers=self.layer_num,
-            k_width=k_width,
-            v_width=v_width,
-            dtype=self.dtype,
-            v_dtype=v_dtype,
-            buffers=native,
-        )
+        if _is_npu and memfabric_host_memory_enabled():
+            ensure_memfabric_host_capacity(sum(self.get_mapping_lengths()))
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,
