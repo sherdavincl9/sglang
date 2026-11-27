@@ -21,6 +21,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
         scale_buffer = [torch.empty((2, 32, 1, 1), dtype=torch.float16)]
         c4_buffer = [torch.empty((2, 32, 1, 8), dtype=torch.int8)]
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+            DSV4NPUTokenToKVPool,
             NPUDeepSeekV4IndexerPool,
             NPUDeepSeekV4SingleKVPool,
         )
@@ -43,6 +44,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_indexer_kv_pool=indexer_pool,
             start_layer=5,
             stage_layer_ids=(5,),
+            get_mapping_lengths=DSV4NPUTokenToKVPool.get_mapping_lengths,
             get_device_pool_infos=lambda: tuple(
                 DevicePoolInfo(
                     pool_name=name,
@@ -74,6 +76,8 @@ class TestDSV4PoolAssembly(CustomTestCase):
         )
         memory = SimpleNamespace(
             hicache_mem_layout="page_first",
+            hicache_size=0,
+            hicache_ratio=1.0,
             hicache_write_policy="write_through",
             hicache_io_backend="kernel_ascend",
             hicache_host_memory_mode="cache",
@@ -87,7 +91,12 @@ class TestDSV4PoolAssembly(CustomTestCase):
             can_use_write_back_jit=False,
         )
 
+        expected_bytes = 2 * sum(
+            pool.buffer_info.page_bytes for pool in kvcache.get_device_pool_infos()
+        )
+
         def make_host_pool(**kwargs):
+            reserve_host_memory.assert_called_once_with(expected_bytes)
             return SimpleNamespace(
                 **kwargs,
                 page_size=kwargs["slot_page_size"],
@@ -100,12 +109,11 @@ class TestDSV4PoolAssembly(CustomTestCase):
         controller = object()
         with (
             patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(assembler, "is_npu", return_value=True),
+            patch.object(assembler, "memfabric_host_memory_enabled", return_value=True),
             patch.object(
-                assembler, "reserve_dsv4_paged_host_memory"
+                assembler, "ensure_memfabric_host_capacity"
             ) as reserve_host_memory,
-            patch.object(
-                assembler, "_deepseek_v4_num_host_pages", return_value=(2, 0, 0)
-            ),
             patch.object(assembler, "_get_allocator_type", return_value="default"),
             patch.object(assembler, "LogicalHostPool", return_value=logical_pool),
             patch.object(
@@ -122,7 +130,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
                 storage_backend=None,
             )
 
-        reserve_host_memory.assert_called_once()
+        reserve_host_memory.assert_called_once_with(expected_bytes)
         k_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER].host_pool
         scale_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE].host_pool
         self.assertIs(k_host.device_buffers[0], k_buffer[0])

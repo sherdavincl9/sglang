@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
@@ -445,31 +446,15 @@ class TestDSV4HostViews(CustomTestCase):
             ),
         )
 
-    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
-        infos = {PoolName.SWA: self._paged_pool_info(2, 6)}
-        backend = MagicMock()
+    def test_acl_skips_memfabric_reservation(self):
         with (
-            patch.object(npu_host_memory, "is_npu", return_value=True),
             patch.object(
-                npu_host_memory,
-                "get_memory",
-                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+                npu_host_memory, "memfabric_host_memory_enabled", return_value=False
             ),
-            patch.object(
-                npu_host_memory, "get_host_memory_backend", return_value=backend
-            ),
-            patch.object(
-                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
-            ),
+            patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
         ):
-            npu_host_memory.reserve_dsv4_paged_host_memory(
-                infos=infos,
-                num_host_pages=4,
-                swa_num_host_pages=4,
-                c128_num_host_pages=0,
-                num_draft_swa_layers=0,
-            )
-        backend.ensure_capacity.assert_called_once_with(48, 0)
+            npu_host_memory.ensure_memfabric_host_capacity(48)
+        get_backend.assert_not_called()
 
     def test_capacity_declares_actual_paged_and_state_allocations(self):
         def checkpoint_info(num_layers, ring_bytes):
@@ -492,50 +477,35 @@ class TestDSV4HostViews(CustomTestCase):
             "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
             "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
         }
-        for backend_name in ("acl", "memfabric"):
-            for layout, blocks in expected_blocks.items():
-                backend = MagicMock(name=backend_name)
-                with (
-                    self.subTest(backend=backend_name, layout=layout),
-                    patch.object(npu_host_memory, "is_npu", return_value=True),
-                    patch.object(
-                        npu_host_memory,
-                        "get_memory",
-                        return_value=SimpleNamespace(hicache_mem_layout=layout),
-                    ),
-                    patch.object(
-                        npu_host_memory, "get_host_memory_backend", return_value=backend
-                    ),
-                    patch.object(
-                        torch,
-                        "npu",
-                        SimpleNamespace(current_device=lambda: 0),
-                        create=True,
-                    ),
-                ):
-                    npu_host_memory.reserve_dsv4_paged_host_memory(
-                        infos=infos,
-                        num_host_pages=4,
-                        swa_num_host_pages=4,
-                        c128_num_host_pages=2,
-                        num_draft_swa_layers=1,
-                    )
+        for layout, blocks in expected_blocks.items():
+            backend = MagicMock()
+            with (
+                self.subTest(layout=layout),
+                patch.object(
+                    npu_host_memory, "memfabric_host_memory_enabled", return_value=True
+                ),
+                patch.object(
+                    npu_host_memory, "get_host_memory_backend", return_value=backend
+                ),
+                patch.object(
+                    torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+                ),
+            ):
+                lengths = DeepSeekV4TokenToKVPool.get_mapping_lengths(
+                    infos, (4, 4, 2), 1, layout
+                )
+                self.assertEqual(lengths, blocks)
+                npu_host_memory.ensure_memfabric_host_capacity(sum(lengths))
                 backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
 
-    def test_non_npu_skips_host_memory_reservation(self):
+    def test_zero_bytes_skip_memfabric_reservation(self):
         with (
-            patch.object(npu_host_memory, "is_npu", return_value=False),
-            patch.object(npu_host_memory, "get_memory") as get_memory,
+            patch.object(
+                npu_host_memory, "memfabric_host_memory_enabled", return_value=True
+            ),
             patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
         ):
-            npu_host_memory.reserve_dsv4_paged_host_memory(
-                infos={},
-                num_host_pages=0,
-                swa_num_host_pages=0,
-                c128_num_host_pages=0,
-                num_draft_swa_layers=0,
-            )
-        get_memory.assert_not_called()
+            npu_host_memory.ensure_memfabric_host_capacity(0)
         get_backend.assert_not_called()
 
 

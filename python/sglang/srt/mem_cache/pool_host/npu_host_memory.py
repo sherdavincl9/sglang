@@ -26,20 +26,16 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Mapping
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
-from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLASplitBuffers
+    from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -360,71 +356,12 @@ def reserve_mla_split_host_memory(
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
-def reserve_dsv4_paged_host_memory(
-    *,
-    infos: Mapping[PoolName, DevicePoolInfo],
-    num_host_pages: int,
-    swa_num_host_pages: int,
-    c128_num_host_pages: int,
-    num_draft_swa_layers: int,
-) -> None:
-    """Reserve DSV4 paged buffers before constructing the host pools."""
-    if not is_npu():
-        return
-
-    # Declare every DSV4 paged host block before constructing the SWA pool.
-    # Per-block byte sizes; MemFabric fixes its reservation at the first
-    # declaration, so the blocks are summed before declaring.
-    paged_blocks = []
-    layer_first = get_memory().hicache_mem_layout == "layer_first"
-
-    def add_blocks(layer_bytes):
-        if not layer_bytes:
-            return
-        # Match actual allocator calls: one block per layer for layer_first,
-        # one block for the entire pool for page-first layouts.
-        if layer_first:
-            paged_blocks.extend(layer_bytes)
-        else:
-            paged_blocks.append(sum(layer_bytes))
-
-    def add_paged(name: PoolName, pages: int, draft_layers: int = 0) -> None:
-        info = infos.get(name)
-        if info is not None:
-            region = info.buffer_info
-            add_blocks(
-                [pages * region.page_bytes] * (len(region.buffers) + draft_layers)
-            )
-
-    add_paged(PoolName.SWA, swa_num_host_pages, num_draft_swa_layers)
-    c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
-    if c4 is not None and c4.layer_ids:
-        for name in (
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-            PoolName.DEEPSEEK_V4_C4_ROPE,
-        ):
-            add_paged(name, num_host_pages)
-        for name in (
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-        ):
-            checkpoint = infos.get(name)
-            if checkpoint is not None:
-                add_blocks(
-                    [
-                        swa_num_host_pages * state.pages.shape[1]
-                        for state in checkpoint.buffer_info.states
-                    ]
-                )
-    c128 = infos.get(PoolName.DEEPSEEK_V4_C128)
-    if c128 is not None and c128.layer_ids:
-        add_paged(PoolName.DEEPSEEK_V4_C128, c128_num_host_pages)
-        add_paged(PoolName.DEEPSEEK_V4_C128_ROPE, c128_num_host_pages)
-    backend = get_host_memory_backend()
-    if paged_blocks and backend is not None:
-        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
+def ensure_memfabric_host_capacity(total_bytes: int) -> None:
+    """Pass the calculated Host bytes to the MemFabric backend."""
+    if total_bytes and memfabric_host_memory_enabled():
+        backend = get_host_memory_backend()
+        if backend is not None:
+            backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
 # ---------------------------------------------------------------------------

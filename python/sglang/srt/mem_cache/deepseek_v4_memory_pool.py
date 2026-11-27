@@ -1538,6 +1538,59 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 infos.extend(self._compressed_pool_infos(ratio, tuple(sources)))
         return tuple(infos)
 
+    @staticmethod
+    def get_mapping_lengths(
+        pool_infos: dict[PoolName, DevicePoolInfo],
+        host_pages: tuple[int, int, int],
+        num_draft_swa_layers: int,
+        layout: str,
+    ) -> list[int]:
+        """Return DSV4's paged Host mappings before any child pool is allocated."""
+        full_pages, swa_pages, c128_pages = host_pages
+        lengths = []
+
+        def add_mappings(layer_lengths: list[int]) -> None:
+            if layout == "layer_first":
+                lengths.extend(layer_lengths)
+            elif layer_lengths:
+                lengths.append(sum(layer_lengths))
+
+        def add_paged(name: PoolName, pages: int, draft_layers: int = 0) -> None:
+            info = pool_infos.get(name)
+            if info is not None:
+                region = info.buffer_info
+                add_mappings(
+                    [pages * region.page_bytes] * (len(region.buffers) + draft_layers)
+                )
+
+        add_paged(PoolName.SWA, swa_pages, num_draft_swa_layers)
+        c4 = pool_infos.get(PoolName.DEEPSEEK_V4_C4)
+        if c4 is not None and c4.layer_ids:
+            for name in (
+                PoolName.DEEPSEEK_V4_C4,
+                PoolName.DEEPSEEK_V4_C4_INDEXER,
+                PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+                PoolName.DEEPSEEK_V4_C4_ROPE,
+            ):
+                add_paged(name, full_pages)
+            for name in (
+                PoolName.DEEPSEEK_V4_C4_STATE,
+                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            ):
+                checkpoint = pool_infos.get(name)
+                if checkpoint is not None:
+                    add_mappings(
+                        [
+                            swa_pages * state.pages.shape[1]
+                            for state in checkpoint.buffer_info.states
+                        ]
+                    )
+        c128 = pool_infos.get(PoolName.DEEPSEEK_V4_C128)
+        if c128 is not None and c128.layer_ids:
+            add_paged(PoolName.DEEPSEEK_V4_C128, c128_pages)
+            add_paged(PoolName.DEEPSEEK_V4_C128_ROPE, c128_pages)
+        return lengths
+
     def _compressed_pool_infos(
         self, ratio: int, layer_ids: tuple[int, ...]
     ) -> list[DevicePoolInfo]:

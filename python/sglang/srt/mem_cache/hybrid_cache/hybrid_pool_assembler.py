@@ -43,7 +43,8 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    reserve_dsv4_paged_host_memory,
+    ensure_memfabric_host_capacity,
+    memfabric_host_memory_enabled,
 )
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     tree_slot_ids,
 )
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -857,13 +859,17 @@ def build_deepseek_v4_hicache_stack(
         c128_attn_allocator=c128_attn_allocator,
     )
 
-    reserve_dsv4_paged_host_memory(
-        infos=infos,
-        num_host_pages=num_host_pages,
-        swa_num_host_pages=swa_num_host_pages,
-        c128_num_host_pages=c128_num_host_pages,
-        num_draft_swa_layers=len(mtp_swa_device_buffers),
-    )
+    if is_npu() and memfabric_host_memory_enabled():
+        ensure_memfabric_host_capacity(
+            sum(
+                kvcache.get_mapping_lengths(
+                    infos,
+                    (num_host_pages, swa_num_host_pages, c128_num_host_pages),
+                    len(mtp_swa_device_buffers),
+                    get_memory().hicache_mem_layout,
+                )
+            )
+        )
 
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
