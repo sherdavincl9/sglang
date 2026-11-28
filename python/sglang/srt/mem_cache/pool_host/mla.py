@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    ensure_memfabric_host_capacity,
+    create_memfabric_host_backend,
     memfabric_host_memory_enabled,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
@@ -547,7 +547,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             v_dtype = native.v.dtype
 
         if _is_npu and memfabric_host_memory_enabled():
-            ensure_memfabric_host_capacity(sum(self.get_mapping_lengths()))
+            backend = create_memfabric_host_backend(
+                self.get_mapping_lengths(),
+                allocator=self.allocator,
+                device=self._transfer_device,
+            )
+            if backend is not None:
+                alloc_func = backend.alloc
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,

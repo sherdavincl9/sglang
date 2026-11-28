@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import sys
 import unittest
@@ -99,6 +100,96 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
             self.assertEqual(allocate(**kwargs), "acl")
             acl.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
 
+    def test_memfabric_host_pools_use_distinct_owners(self):
+        path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
+        tree = ast.parse(path.read_text())
+        names = {
+            "NpuHostMemoryBackend",
+            "MemfabricHostMemoryBackend",
+            "get_host_memory_backend",
+            "create_memfabric_host_backend",
+        }
+        nodes = [
+            node
+            for node in tree.body
+            if (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+            or getattr(node, "name", None) in names
+        ]
+        pools = []
+
+        class Offload:
+            def __init__(self):
+                pools.append(self)
+
+            def initialize(self, config):
+                self.capacity = config.reserve_size
+                return 0
+
+            def empty(self, dims, dtype):
+                return Buffer(dims, dtype)
+
+        offload_module = SimpleNamespace(
+            Offload=Offload,
+            OffloadConfig=SimpleNamespace,
+            Scene=SimpleNamespace(LOCAL=0),
+            Executor=SimpleNamespace(AICPU=1),
+        )
+        register = Mock()
+        publish = Mock()
+        preflight = Mock(side_effect=lambda lengths, *args: (sum(lengths), 64))
+        modules = {
+            "memfabric_hybrid": SimpleNamespace(offload=offload_module),
+            "sgl_kernel_npu.operators.mem_cache.memfabric.host_memory": SimpleNamespace(
+                register_host_memory_for_pool=register, set_memfabric_pool=publish
+            ),
+            "sglang.srt.mem_cache.pool_host.base": SimpleNamespace(
+                host_memory_preflight=preflight
+            ),
+        }
+        namespace = dict(
+            math=math,
+            logger=Mock(),
+            torch=SimpleNamespace(npu=SimpleNamespace(current_device=lambda: 0)),
+            _MEMFABRIC_GB=64,
+            _backend=None,
+            memfabric_host_memory_enabled=lambda: True,
+        )
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"),
+            namespace,
+        )
+        get_backend = namespace["get_host_memory_backend"]
+        create_backend = namespace["create_memfabric_host_backend"]
+        dtype = SimpleNamespace(itemsize=1)
+
+        with patch.dict(sys.modules, modules):
+            original = get_backend()
+            original.ensure_capacity(64, 0)
+            first = create_backend([17, 1], allocator=None, device="npu")
+            first_buffer = first.alloc(
+                (17,), dtype, "cpu", True, None, registration_granularity_bytes=17
+            )
+            first_scale = first.alloc((1,), dtype, "cpu", True, None)
+            self.assertIs(get_backend(), original)
+
+            second = create_backend([25], allocator=None, device="npu")
+            second_buffer = second.alloc((25,), dtype, "cpu", True, None)
+            self.assertIs(get_backend(), original)
+
+        self.assertEqual([pool.capacity for pool in pools], [64, 48, 32])
+        publish.assert_called_once_with(pools[0])
+        self.assertEqual(
+            [call.args for call in register.call_args_list],
+            [
+                (first_buffer, pools[1]),
+                (first_scale, pools[1]),
+                (second_buffer, pools[2]),
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in preflight.call_args_list], [[46], [39]]
+        )
+
 
 class TestNPUSparseDispatch(unittest.TestCase):
     def setUp(self):
@@ -136,6 +227,10 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 and n.name == "ensure_memfabric_host_capacity"
             )
         )
+
+        def legacy_create_memfabric_host_backend(lengths, **kwargs):
+            self.namespace["ensure_memfabric_host_capacity"](sum(lengths))
+
         self.ops = {
             name: Mock(name=name)
             for name in (
@@ -156,6 +251,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ),
             get_host_memory_backend=lambda: None,
             memfabric_host_memory_enabled=lambda: True,
+            create_memfabric_host_backend=legacy_create_memfabric_host_backend,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})

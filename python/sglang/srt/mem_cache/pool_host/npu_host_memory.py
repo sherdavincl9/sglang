@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections.abc import Callable
 from functools import lru_cache
 
 import torch
@@ -107,12 +108,17 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
     ``pool.initialize`` reserves and pre-registers the whole DRAM range, so
     every ``pool.malloc``/``pool.empty`` block is device-visible immediately
     (16-byte-bump allocation, no per-block GB rounding), and
-    ``pool.host_register`` on a block is an idempotent in-pool check.  The
-    instance is published via the kernel-side ``set_memfabric_pool``
-    so its register/get-device-pointer calls resolve through the same pool.
+    ``pool.host_register`` on a block is an idempotent in-pool check.
+    Independent pools register their own blocks with an explicit owner.
+    The default backend publishes its owner for legacy callers.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        register_block_for_pool: Callable[[torch.Tensor, object], object] | None = None,
+    ):
+        self._register_block_for_pool = register_block_for_pool
         self._pool = None
         self._initialized = False
         self._reserved_bytes = 0
@@ -142,6 +148,9 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         happens once, at allocation time; interior views resolve by byte
         offset at transfer time.
         """
+        if self._register_block_for_pool is not None:
+            self._register_block_for_pool(tensor, self._pool)
+            return
         try:
             from sgl_kernel_npu.operators.mem_cache.memfabric.host_memory import (
                 register_host_memory,
@@ -189,7 +198,8 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
                     f"Offload.initialize failed: ret={ret}, "
                     f"device_id={device_id}, reserve_size={total_bytes}"
                 )
-            set_memfabric_pool(self._pool)
+            if self._register_block_for_pool is None:
+                set_memfabric_pool(self._pool)
             self._initialized = True
             self._reserved_bytes = total_bytes
             self._device_id = device_id
@@ -223,10 +233,13 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         device: str,
         pin_memory: bool,
         allocator: None,
+        *,
+        registration_granularity_bytes: int | None = None,
     ) -> torch.Tensor:
         """Allocate one host-pool block and enter it into the DVA table.
 
-        The Python-side accounting tracks the exact block byte size.
+        MemFabric registers the entire instance range during initialization,
+        so allocation does not use registration_granularity_bytes.
         """
         if not self._initialized:
             raise RuntimeError("MemFabric ensure_capacity must run before alloc")
@@ -299,9 +312,8 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     """Return the backend selected by SGLANG_HICACHE_HOST_MEM_BACKEND.
 
     Returns None when no registered-host-memory backend is configured;
-    callers then fall back to plain pinned memory.  The instance is cached,
-    so the selection and the MemFabric entity state are process-wide
-    singletons.
+    callers then fall back to plain pinned memory. The selected default
+    backend is cached process-wide.
     """
     global _backend
     if _backend is None:
@@ -318,6 +330,44 @@ def ensure_memfabric_host_capacity(total_bytes: int) -> None:
         backend = get_host_memory_backend()
         if backend is not None:
             backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
+def create_memfabric_host_backend(
+    mapping_lengths: list[int], *, allocator, device
+) -> MemfabricHostMemoryBackend | None:
+    """Initialize an instance for one HiCache Host pool."""
+    try:
+        from sgl_kernel_npu.operators.mem_cache.memfabric.host_memory import (
+            register_host_memory_for_pool,
+        )
+    except ImportError:
+        # Older kernel wheels use the published process-wide instance.
+        ensure_memfabric_host_capacity(sum(mapping_lengths))
+        return None
+
+    total_bytes = sum((length + 15) // 16 * 16 for length in mapping_lengths)
+    if not total_bytes:
+        return None
+
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+
+    # The Host constructor already charged the raw mappings. Book the extra
+    # RAM consumed by this Offload instance's LOCAL GiB rounding.
+    physical_bytes = -(-total_bytes // _MEMFABRIC_GB) * _MEMFABRIC_GB
+    extra_bytes = physical_bytes - sum(mapping_lengths)
+    if extra_bytes:
+        needed, available = host_memory_preflight([extra_bytes], allocator, device)
+        if needed > available:
+            raise ValueError(
+                "Not enough Host memory for MemFabric instance alignment "
+                f"({needed} additional bytes required, {available} available)"
+            )
+
+    backend = MemfabricHostMemoryBackend(
+        register_block_for_pool=register_host_memory_for_pool
+    )
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+    return backend
 
 
 # ---------------------------------------------------------------------------

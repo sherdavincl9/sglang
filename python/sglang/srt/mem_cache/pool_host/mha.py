@@ -53,6 +53,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    create_memfabric_host_backend,
+    memfabric_host_memory_enabled,
+)
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -354,6 +358,20 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.layout_dim = self.token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
+        if (
+            self._transfer_device.type == "npu"
+            and memfabric_host_memory_enabled()
+            and type(self) is MHATokenToKVPoolHost
+            and self.pool_label in ("draft", "draft_swa")
+            and self.layout == "page_first_direct"
+        ):
+            backend = create_memfabric_host_backend(
+                self.get_mapping_lengths(),
+                allocator=self.allocator,
+                device=self._transfer_device,
+            )
+            if backend is not None:
+                alloc_func = backend.alloc
         buffer = alloc_func(
             dims,
             dtype=self.dtype,

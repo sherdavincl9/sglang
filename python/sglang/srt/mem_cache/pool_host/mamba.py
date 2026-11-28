@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    ensure_memfabric_host_capacity,
+    create_memfabric_host_backend,
     memfabric_host_memory_enabled,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -208,9 +208,8 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        mapping_lengths = self.get_mapping_lengths()
         allocation_bytes, available_bytes = host_memory_preflight(
-            mapping_lengths,
+            self.get_mapping_lengths(),
             self.allocator,
             self._buffer_device,
         )
@@ -248,8 +247,6 @@ class MambaPoolHost(HostKVCache):
             for layers in self.conv_device_layers
         ]
 
-        if self._buffer_device.type == "npu" and memfabric_host_memory_enabled():
-            ensure_memfabric_host_capacity(sum(mapping_lengths))
         self.kv_buffer = self.init_kv_buffer()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
@@ -283,6 +280,14 @@ class MambaPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
+        if self._buffer_device.type == "npu" and memfabric_host_memory_enabled():
+            backend = create_memfabric_host_backend(
+                self.get_mapping_lengths(),
+                allocator=self.allocator,
+                device=self._buffer_device,
+            )
+            if backend is not None:
+                _host_alloc = backend.alloc
 
         def alloc_func(dims, *, dtype, device, pin_memory, allocator):
             # conv-only linear attention has no ssm state: mmap can't map the
